@@ -43,6 +43,7 @@ module.exports = {
         'architecture/networking',
         'architecture/storage',
         'architecture/nodes',
+        'architecture/synced-resources',
       ],
     },
     {
@@ -53,8 +54,28 @@ module.exports = {
         'operator/external-access',
         'operator/external-datastore',
         'operator/accessing-vcluster',
+        'operator/init-manifests',
         'operator/monitoring',
+        'operator/high-availability',
+        'operator/other-distributions',
+        'operator/restricted-hosts',
+        'operator/pausing-vcluster',
+        'operator/backup',
+        'operator/security',
       ],
+    },
+    {
+      type: "category",
+      label: "Plugins",
+      collapsed: false,
+      items: [
+          'plugins/overview',
+          'plugins/tutorial',
+      ]
+    },
+    {
+      type: 'doc',
+      id: 'troubleshooting',
     },
     {
       type: 'doc',

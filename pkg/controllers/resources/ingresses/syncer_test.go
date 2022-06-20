@@ -1,13 +1,13 @@
 package ingresses
 
 import (
-	"context"
+	synccontext "github.com/loft-sh/vcluster/pkg/controllers/syncer/context"
+	"github.com/loft-sh/vcluster/pkg/controllers/syncer/translator"
+	"gotest.tools/assert"
+	"k8s.io/apimachinery/pkg/types"
 	"testing"
 
-	generictesting "github.com/loft-sh/vcluster/pkg/controllers/resources/generic/testing"
-	"github.com/loft-sh/vcluster/pkg/util/locks"
-	"github.com/loft-sh/vcluster/pkg/util/loghelper"
-	testingutil "github.com/loft-sh/vcluster/pkg/util/testing"
+	generictesting "github.com/loft-sh/vcluster/pkg/controllers/syncer/testing"
 	"github.com/loft-sh/vcluster/pkg/util/translate"
 
 	corev1 "k8s.io/api/core/v1"
@@ -16,16 +16,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
-
-func newFakeSyncer(lockFactory locks.LockFactory, pClient *testingutil.FakeIndexClient, vClient *testingutil.FakeIndexClient) *syncer {
-	return &syncer{
-		sharedMutex:     lockFactory.GetLock("ingress-controller"),
-		eventRecoder:    &testingutil.FakeEventRecorder{},
-		targetNamespace: "test",
-		virtualClient:   vClient,
-		localClient:     pClient,
-	}
-}
 
 func TestSync(t *testing.T) {
 	vBaseSpec := networkingv1.IngressSpec{
@@ -66,10 +56,10 @@ func TestSync(t *testing.T) {
 	pBaseSpec := networkingv1.IngressSpec{
 		DefaultBackend: &networkingv1.IngressBackend{
 			Service: &networkingv1.IngressServiceBackend{
-				Name: translate.PhysicalName("testservice", "testns"),
+				Name: translate.PhysicalName("testservice", "test"),
 			},
 			Resource: &corev1.TypedLocalObjectReference{
-				Name: translate.PhysicalName("testbackendresource", "testns"),
+				Name: translate.PhysicalName("testbackendresource", "test"),
 			},
 		},
 		Rules: []networkingv1.IngressRule{
@@ -80,10 +70,10 @@ func TestSync(t *testing.T) {
 							{
 								Backend: networkingv1.IngressBackend{
 									Service: &networkingv1.IngressServiceBackend{
-										Name: translate.PhysicalName("testbackendservice", "testns"),
+										Name: translate.PhysicalName("testbackendservice", "test"),
 									},
 									Resource: &corev1.TypedLocalObjectReference{
-										Name: translate.PhysicalName("testbackendresource", "testns"),
+										Name: translate.PhysicalName("testbackendresource", "test"),
 									},
 								},
 							},
@@ -94,7 +84,7 @@ func TestSync(t *testing.T) {
 		},
 		TLS: []networkingv1.IngressTLS{
 			{
-				SecretName: translate.PhysicalName("testtlssecret", "testns"),
+				SecretName: translate.PhysicalName("testtlssecret", "test"),
 			},
 		},
 	}
@@ -109,16 +99,19 @@ func TestSync(t *testing.T) {
 		},
 	}
 	vObjectMeta := metav1.ObjectMeta{
-		Name:        "testingress",
-		Namespace:   "testns",
-		ClusterName: "myvcluster",
+		Name:      "testingress",
+		Namespace: "test",
 	}
 	pObjectMeta := metav1.ObjectMeta{
-		Name:      translate.PhysicalName("testingress", "testns"),
+		Name:      translate.PhysicalName("testingress", "test"),
 		Namespace: "test",
+		Annotations: map[string]string{
+			translator.NameAnnotation:      vObjectMeta.Name,
+			translator.NamespaceAnnotation: vObjectMeta.Namespace,
+		},
 		Labels: map[string]string{
 			translate.MarkerLabel:    translate.Suffix,
-			translate.NamespaceLabel: translate.NamespaceLabelValue(vObjectMeta.Namespace),
+			translate.NamespaceLabel: vObjectMeta.Namespace,
 		},
 	}
 	baseIngress := &networkingv1.Ingress{
@@ -128,18 +121,6 @@ func TestSync(t *testing.T) {
 	createdIngress := &networkingv1.Ingress{
 		ObjectMeta: pObjectMeta,
 		Spec:       pBaseSpec,
-	}
-	updateIngress := &networkingv1.Ingress{
-		ObjectMeta: vObjectMeta,
-		Spec: networkingv1.IngressSpec{
-			IngressClassName: stringPointer("updatedingressclass"),
-		},
-	}
-	updatedIngress := &networkingv1.Ingress{
-		ObjectMeta: pObjectMeta,
-		Spec: networkingv1.IngressSpec{
-			IngressClassName: stringPointer("updatedingressclass"),
-		},
 	}
 	noUpdateIngress := &networkingv1.Ingress{
 		ObjectMeta: vObjectMeta,
@@ -153,6 +134,12 @@ func TestSync(t *testing.T) {
 		},
 		Status: changedIngressStatus,
 	}
+	pBackwardUpdatedIngress := &networkingv1.Ingress{
+		ObjectMeta: pObjectMeta,
+		Spec:       pBaseSpec,
+		Status:     changedIngressStatus,
+	}
+	pBackwardUpdatedIngress.Spec.IngressClassName = stringPointer("backwardsupdatedingressclass")
 	backwardNoUpdateIngress := &networkingv1.Ingress{
 		ObjectMeta: pObjectMeta,
 		Spec:       networkingv1.IngressSpec{},
@@ -167,129 +154,206 @@ func TestSync(t *testing.T) {
 		},
 		Status: changedIngressStatus,
 	}
-	lockFactory := locks.NewDefaultLockFactory()
 
 	generictesting.RunTests(t, []*generictesting.SyncTest{
 		{
 			Name:                "Create forward",
-			InitialVirtualState: []runtime.Object{baseIngress},
+			InitialVirtualState: []runtime.Object{baseIngress.DeepCopy()},
 			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
-				networkingv1.SchemeGroupVersion.WithKind("Ingress"): {baseIngress},
+				networkingv1.SchemeGroupVersion.WithKind("Ingress"): {baseIngress.DeepCopy()},
 			},
 			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
-				networkingv1.SchemeGroupVersion.WithKind("Ingress"): {createdIngress},
+				networkingv1.SchemeGroupVersion.WithKind("Ingress"): {createdIngress.DeepCopy()},
 			},
-			Sync: func(ctx context.Context, pClient *testingutil.FakeIndexClient, vClient *testingutil.FakeIndexClient, scheme *runtime.Scheme, log loghelper.Logger) {
-				syncer := newFakeSyncer(lockFactory, pClient, vClient)
-
-				_, err := syncer.ForwardCreate(ctx, baseIngress, log)
-				if err != nil {
-					t.Fatal(err)
-				}
+			Sync: func(registerContext *synccontext.RegisterContext) {
+				syncCtx, syncer := generictesting.FakeStartSyncer(t, registerContext, NewSyncer)
+				_, err := syncer.(*ingressSyncer).SyncDown(syncCtx, baseIngress.DeepCopy())
+				assert.NilError(t, err)
 			},
 		},
 		{
-			Name:                 "Update forward",
-			InitialVirtualState:  []runtime.Object{baseIngress},
-			InitialPhysicalState: []runtime.Object{createdIngress},
+			Name: "Update forward",
+			InitialVirtualState: []runtime.Object{&networkingv1.Ingress{
+				ObjectMeta: vObjectMeta,
+				Spec:       *vBaseSpec.DeepCopy(),
+			}},
+			InitialPhysicalState: []runtime.Object{&networkingv1.Ingress{
+				ObjectMeta: pObjectMeta,
+				Spec:       networkingv1.IngressSpec{},
+			}},
 			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
-				networkingv1.SchemeGroupVersion.WithKind("Ingress"): {baseIngress},
+				networkingv1.SchemeGroupVersion.WithKind("Ingress"): {&networkingv1.Ingress{
+					ObjectMeta: vObjectMeta,
+					Spec:       *vBaseSpec.DeepCopy(),
+				}},
 			},
 			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
-				networkingv1.SchemeGroupVersion.WithKind("Ingress"): {updatedIngress},
+				networkingv1.SchemeGroupVersion.WithKind("Ingress"): {&networkingv1.Ingress{
+					ObjectMeta: pObjectMeta,
+					Spec:       *pBaseSpec.DeepCopy(),
+				}},
 			},
-			Sync: func(ctx context.Context, pClient *testingutil.FakeIndexClient, vClient *testingutil.FakeIndexClient, scheme *runtime.Scheme, log loghelper.Logger) {
-				syncer := newFakeSyncer(lockFactory, pClient, vClient)
-				needed, err := syncer.ForwardUpdateNeeded(createdIngress, updateIngress)
-				if err != nil {
-					t.Fatal(err)
-				} else if !needed {
-					t.Fatal("Expected backward update to be needed")
+			Sync: func(registerContext *synccontext.RegisterContext) {
+				syncCtx, syncer := generictesting.FakeStartSyncer(t, registerContext, NewSyncer)
+				pIngress := &networkingv1.Ingress{
+					ObjectMeta: pObjectMeta,
+					Spec:       networkingv1.IngressSpec{},
 				}
+				pIngress.ResourceVersion = "999"
 
-				_, err = syncer.ForwardUpdate(ctx, createdIngress, updateIngress, log)
-				if err != nil {
-					t.Fatal(err)
-				}
+				_, err := syncer.(*ingressSyncer).Sync(syncCtx, pIngress, &networkingv1.Ingress{
+					ObjectMeta: vObjectMeta,
+					Spec:       *vBaseSpec.DeepCopy(),
+				})
+				assert.NilError(t, err)
 			},
 		},
 		{
 			Name:                 "Update forward not needed",
-			InitialVirtualState:  []runtime.Object{baseIngress},
-			InitialPhysicalState: []runtime.Object{createdIngress},
+			InitialVirtualState:  []runtime.Object{baseIngress.DeepCopy()},
+			InitialPhysicalState: []runtime.Object{createdIngress.DeepCopy()},
 			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
-				networkingv1.SchemeGroupVersion.WithKind("Ingress"): {baseIngress},
+				networkingv1.SchemeGroupVersion.WithKind("Ingress"): {baseIngress.DeepCopy()},
 			},
 			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
-				networkingv1.SchemeGroupVersion.WithKind("Ingress"): {createdIngress},
+				networkingv1.SchemeGroupVersion.WithKind("Ingress"): {createdIngress.DeepCopy()},
 			},
-			Sync: func(ctx context.Context, pClient *testingutil.FakeIndexClient, vClient *testingutil.FakeIndexClient, scheme *runtime.Scheme, log loghelper.Logger) {
-				syncer := newFakeSyncer(lockFactory, pClient, vClient)
-				needed, err := syncer.ForwardUpdateNeeded(createdIngress, noUpdateIngress)
-				if err != nil {
-					t.Fatal(err)
-				} else if needed {
-					t.Fatal("Expected backward update to be not needed")
-				}
+			Sync: func(registerContext *synccontext.RegisterContext) {
+				syncCtx, syncer := generictesting.FakeStartSyncer(t, registerContext, NewSyncer)
+				vIngress := noUpdateIngress.DeepCopy()
+				vIngress.ResourceVersion = "999"
 
-				_, err = syncer.ForwardUpdate(ctx, createdIngress, noUpdateIngress, log)
-				if err != nil {
-					t.Fatal(err)
-				}
+				_, err := syncer.(*ingressSyncer).Sync(syncCtx, createdIngress.DeepCopy(), vIngress)
+				assert.NilError(t, err)
 			},
 		},
 		{
 			Name:                 "Update backwards",
-			InitialVirtualState:  []runtime.Object{baseIngress},
-			InitialPhysicalState: []runtime.Object{createdIngress},
+			InitialVirtualState:  []runtime.Object{baseIngress.DeepCopy()},
+			InitialPhysicalState: []runtime.Object{backwardUpdateIngress.DeepCopy()},
 			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
-				networkingv1.SchemeGroupVersion.WithKind("Ingress"): {backwardUpdatedIngress},
+				networkingv1.SchemeGroupVersion.WithKind("Ingress"): {backwardUpdatedIngress.DeepCopy()},
 			},
 			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
-				networkingv1.SchemeGroupVersion.WithKind("Ingress"): {createdIngress},
+				networkingv1.SchemeGroupVersion.WithKind("Ingress"): {pBackwardUpdatedIngress.DeepCopy()},
 			},
-			Sync: func(ctx context.Context, pClient *testingutil.FakeIndexClient, vClient *testingutil.FakeIndexClient, scheme *runtime.Scheme, log loghelper.Logger) {
-				syncer := newFakeSyncer(lockFactory, pClient, vClient)
-				needed, err := syncer.BackwardUpdateNeeded(backwardUpdateIngress, baseIngress)
-				if err != nil {
-					t.Fatal(err)
-				} else if !needed {
-					t.Fatal("Expected backward update to be needed")
-				}
+			Sync: func(registerContext *synccontext.RegisterContext) {
+				syncCtx, syncer := generictesting.FakeStartSyncer(t, registerContext, NewSyncer)
+				backwardUpdateIngress := backwardUpdateIngress.DeepCopy()
+				vIngress := baseIngress.DeepCopy()
+				vIngress.ResourceVersion = "999"
 
-				_, err = syncer.BackwardUpdate(ctx, backwardUpdateIngress, baseIngress, log)
-				if err != nil {
-					t.Fatal(err)
-				}
+				_, err := syncer.(*ingressSyncer).Sync(syncCtx, backwardUpdateIngress, vIngress)
+				assert.NilError(t, err)
+
+				err = syncCtx.VirtualClient.Get(syncCtx.Context, types.NamespacedName{Namespace: vIngress.Namespace, Name: vIngress.Name}, vIngress)
+				assert.NilError(t, err)
+
+				err = syncCtx.PhysicalClient.Get(syncCtx.Context, types.NamespacedName{Namespace: backwardUpdateIngress.Namespace, Name: backwardUpdateIngress.Name}, backwardUpdateIngress)
+				assert.NilError(t, err)
+
+				_, err = syncer.(*ingressSyncer).Sync(syncCtx, backwardUpdateIngress, vIngress)
+				assert.NilError(t, err)
+
+				err = syncCtx.VirtualClient.Get(syncCtx.Context, types.NamespacedName{Namespace: vIngress.Namespace, Name: vIngress.Name}, vIngress)
+				assert.NilError(t, err)
+
+				err = syncCtx.PhysicalClient.Get(syncCtx.Context, types.NamespacedName{Namespace: backwardUpdateIngress.Namespace, Name: backwardUpdateIngress.Name}, backwardUpdateIngress)
+				assert.NilError(t, err)
+
+				_, err = syncer.(*ingressSyncer).Sync(syncCtx, backwardUpdateIngress, vIngress)
+				assert.NilError(t, err)
 			},
 		},
 		{
 			Name:                 "Update backwards not needed",
-			InitialVirtualState:  []runtime.Object{baseIngress},
-			InitialPhysicalState: []runtime.Object{createdIngress},
+			InitialVirtualState:  []runtime.Object{baseIngress.DeepCopy()},
+			InitialPhysicalState: []runtime.Object{createdIngress.DeepCopy()},
 			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
-				networkingv1.SchemeGroupVersion.WithKind("Ingress"): {baseIngress},
+				networkingv1.SchemeGroupVersion.WithKind("Ingress"): {baseIngress.DeepCopy()},
 			},
 			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
-				networkingv1.SchemeGroupVersion.WithKind("Ingress"): {createdIngress},
+				networkingv1.SchemeGroupVersion.WithKind("Ingress"): {createdIngress.DeepCopy()},
 			},
-			Sync: func(ctx context.Context, pClient *testingutil.FakeIndexClient, vClient *testingutil.FakeIndexClient, scheme *runtime.Scheme, log loghelper.Logger) {
-				syncer := newFakeSyncer(lockFactory, pClient, vClient)
-				needed, err := syncer.BackwardUpdateNeeded(backwardNoUpdateIngress, baseIngress)
-				if err != nil {
-					t.Fatal(err)
-				} else if needed {
-					t.Fatal("Expected backward update to be not needed")
-				}
+			Sync: func(registerContext *synccontext.RegisterContext) {
+				pIngress := backwardNoUpdateIngress.DeepCopy()
+				pIngress.ResourceVersion = "999"
 
-				_, err = syncer.BackwardUpdate(ctx, backwardNoUpdateIngress, baseIngress, log)
-				if err != nil {
-					t.Fatal(err)
-				}
+				syncCtx, syncer := generictesting.FakeStartSyncer(t, registerContext, NewSyncer)
+				_, err := syncer.(*ingressSyncer).Sync(syncCtx, pIngress, baseIngress.DeepCopy())
+				assert.NilError(t, err)
+			},
+		},
+		{
+			Name: "Translate annotation",
+			InitialVirtualState: []runtime.Object{
+				&networkingv1.Ingress{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      baseIngress.Name,
+						Namespace: baseIngress.Namespace,
+						Labels:    baseIngress.Labels,
+						Annotations: map[string]string{
+							"nginx.ingress.kubernetes.io/auth-secret": "my-secret",
+						},
+					},
+				},
+			},
+			InitialPhysicalState: []runtime.Object{
+				&networkingv1.Ingress{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      createdIngress.Name,
+						Namespace: createdIngress.Namespace,
+						Labels:    createdIngress.Labels,
+					},
+				},
+			},
+			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
+				networkingv1.SchemeGroupVersion.WithKind("Ingress"): {
+					&networkingv1.Ingress{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      baseIngress.Name,
+							Namespace: baseIngress.Namespace,
+							Labels:    baseIngress.Labels,
+							Annotations: map[string]string{
+								"nginx.ingress.kubernetes.io/auth-secret": "my-secret",
+							},
+						},
+					},
+				},
+			},
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				networkingv1.SchemeGroupVersion.WithKind("Ingress"): {
+					&networkingv1.Ingress{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      createdIngress.Name,
+							Namespace: createdIngress.Namespace,
+							Labels:    createdIngress.Labels,
+							Annotations: map[string]string{
+								"nginx.ingress.kubernetes.io/auth-secret": translate.PhysicalName("my-secret", baseIngress.Namespace),
+								"vcluster.loft.sh/managed-annotations":    "nginx.ingress.kubernetes.io/auth-secret",
+								"vcluster.loft.sh/object-name":            baseIngress.Name,
+								"vcluster.loft.sh/object-namespace":       baseIngress.Namespace,
+							},
+						},
+					},
+				},
+			},
+			Sync: func(registerContext *synccontext.RegisterContext) {
+				syncCtx, syncer := generictesting.FakeStartSyncer(t, registerContext, NewSyncer)
+
+				vIngress := &networkingv1.Ingress{}
+				err := syncCtx.VirtualClient.Get(syncCtx.Context, types.NamespacedName{Name: baseIngress.Name, Namespace: baseIngress.Namespace}, vIngress)
+				assert.NilError(t, err)
+
+				pIngress := &networkingv1.Ingress{}
+				err = syncCtx.PhysicalClient.Get(syncCtx.Context, types.NamespacedName{Name: createdIngress.Name, Namespace: createdIngress.Namespace}, pIngress)
+				assert.NilError(t, err)
+
+				_, err = syncer.(*ingressSyncer).Sync(syncCtx, pIngress, vIngress)
+				assert.NilError(t, err)
 			},
 		},
 	})
-
 }
 
 func stringPointer(str string) *string {

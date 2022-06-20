@@ -1,78 +1,55 @@
 package priorityclasses
 
 import (
-	"context"
-	context2 "github.com/loft-sh/vcluster/cmd/vcluster/context"
-	"github.com/loft-sh/vcluster/pkg/controllers/resources/generic"
-	"github.com/loft-sh/vcluster/pkg/util/loghelper"
+	"github.com/loft-sh/vcluster/pkg/constants"
+	"github.com/loft-sh/vcluster/pkg/controllers/syncer"
+	synccontext "github.com/loft-sh/vcluster/pkg/controllers/syncer/context"
+	"github.com/loft-sh/vcluster/pkg/controllers/syncer/translator"
 	"github.com/loft-sh/vcluster/pkg/util/translate"
 	schedulingv1 "k8s.io/api/scheduling/v1"
-	"k8s.io/apimachinery/pkg/api/equality"
-	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"time"
 )
 
-func RegisterSyncer(ctx *context2.ControllerContext) error {
-	// build syncer and register it
-	return generic.RegisterTwoWayClusterSyncer(ctx, &syncer{
-		targetNamespace: ctx.Options.TargetNamespace,
-		virtualClient:   ctx.VirtualManager.GetClient(),
-		localClient:     ctx.LocalManager.GetClient(),
-	}, "priorityclass")
+func New(ctx *synccontext.RegisterContext) (syncer.Object, error) {
+	return &priorityClassSyncer{
+		Translator: translator.NewClusterTranslator(ctx, "priorityclass", &schedulingv1.PriorityClass{}, NewPriorityClassTranslator(ctx.Options.TargetNamespace)),
+	}, nil
 }
 
-type syncer struct {
-	targetNamespace string
-	localClient     client.Client
-	virtualClient   client.Client
+type priorityClassSyncer struct {
+	translator.Translator
 }
 
-func (s *syncer) IsManaged(pObj runtime.Object) bool {
-	return translate.IsManagedCluster(s.targetNamespace, pObj)
+var _ syncer.IndicesRegisterer = &priorityClassSyncer{}
+
+func (s *priorityClassSyncer) RegisterIndices(ctx *synccontext.RegisterContext) error {
+	return ctx.VirtualManager.GetFieldIndexer().IndexField(ctx.Context, &schedulingv1.PriorityClass{}, constants.IndexByPhysicalName, func(rawObj client.Object) []string {
+		return []string{translatePriorityClassName(ctx.Options.TargetNamespace, rawObj.GetName())}
+	})
 }
 
-func (s *syncer) New() client.Object {
-	return &schedulingv1.PriorityClass{}
-}
+var _ syncer.Syncer = &priorityClassSyncer{}
 
-func (s *syncer) NewList() client.ObjectList {
-	return &schedulingv1.PriorityClassList{}
-}
-
-func (s *syncer) ForwardCreate(ctx context.Context, vObj client.Object, log loghelper.Logger) (ctrl.Result, error) {
-	vPriorityClass := vObj.(*schedulingv1.PriorityClass)
-	newPriorityClass, err := s.translate(vObj)
+func (s *priorityClassSyncer) SyncDown(ctx *synccontext.SyncContext, vObj client.Object) (ctrl.Result, error) {
+	newPriorityClass := s.translate(vObj.(*schedulingv1.PriorityClass))
+	ctx.Log.Infof("create physical priority class %s", newPriorityClass.Name)
+	err := ctx.PhysicalClient.Create(ctx.Context, newPriorityClass)
 	if err != nil {
+		ctx.Log.Infof("error syncing %s to physical cluster: %v", vObj.GetName(), err)
 		return ctrl.Result{}, err
-	}
-
-	log.Infof("create physical priority class %s", newPriorityClass.Name)
-	err = s.localClient.Create(ctx, newPriorityClass)
-	if err != nil {
-		log.Infof("error syncing %s to physical cluster: %v", vPriorityClass.Name, err)
-		return ctrl.Result{RequeueAfter: time.Second}, err
 	}
 
 	return ctrl.Result{}, nil
 }
 
-func (s *syncer) ForwardCreateNeeded(vObj client.Object) (bool, error) {
-	return true, nil
-}
-
-func (s *syncer) ForwardUpdate(ctx context.Context, pObj client.Object, vObj client.Object, log loghelper.Logger) (ctrl.Result, error) {
+func (s *priorityClassSyncer) Sync(ctx *synccontext.SyncContext, pObj client.Object, vObj client.Object) (ctrl.Result, error) {
 	// did the priority class change?
-	pPriorityClass := pObj.(*schedulingv1.PriorityClass)
-	vPriorityClass := vObj.(*schedulingv1.PriorityClass)
-	updated, err := s.calcPriorityClassDiff(pPriorityClass, vPriorityClass)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
+	updated := s.translateUpdate(pObj.(*schedulingv1.PriorityClass), vObj.(*schedulingv1.PriorityClass))
 	if updated != nil {
-		log.Infof("updating physical priority class %s, because virtual priority class has changed", updated.Name)
-		err := s.localClient.Update(ctx, updated)
+		ctx.Log.Infof("updating physical priority class %s, because virtual priority class has changed", updated.Name)
+		translator.PrintChanges(pObj, updated, ctx.Log)
+		err := ctx.PhysicalClient.Update(ctx.Context, updated)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -81,87 +58,13 @@ func (s *syncer) ForwardUpdate(ctx context.Context, pObj client.Object, vObj cli
 	return ctrl.Result{}, nil
 }
 
-func (s *syncer) ForwardUpdateNeeded(pObj client.Object, vObj client.Object) (bool, error) {
-	updated, err := s.calcPriorityClassDiff(pObj.(*schedulingv1.PriorityClass), vObj.(*schedulingv1.PriorityClass))
-	return updated != nil, err
+func NewPriorityClassTranslator(physicalNamespace string) translator.PhysicalNameTranslator {
+	return func(vName string, vObj client.Object) string {
+		return translatePriorityClassName(physicalNamespace, vName)
+	}
 }
 
-func (s *syncer) translate(vObj runtime.Object) (*schedulingv1.PriorityClass, error) {
-	target, err := translate.SetupMetadataCluster(s.targetNamespace, vObj, s)
-	if err != nil {
-		return nil, err
-	}
-
-	// translate the priority class
-	priorityClass := target.(*schedulingv1.PriorityClass)
-	priorityClass.GlobalDefault = false
-	if priorityClass.Value > 1000000000 {
-		priorityClass.Value = 1000000000
-	}
-	return priorityClass, nil
-}
-
-func (s *syncer) calcPriorityClassDiff(pObj, vObj *schedulingv1.PriorityClass) (*schedulingv1.PriorityClass, error) {
-	var updated *schedulingv1.PriorityClass
-
-	// check subsets
-	if !equality.Semantic.DeepEqual(vObj.PreemptionPolicy, pObj.PreemptionPolicy) {
-		updated = pObj.DeepCopy()
-		updated.PreemptionPolicy = vObj.PreemptionPolicy
-	}
-
-	// check annotations
-	if !equality.Semantic.DeepEqual(vObj.Annotations, pObj.Annotations) {
-		if updated == nil {
-			updated = pObj.DeepCopy()
-		}
-		updated.Annotations = vObj.Annotations
-	}
-
-	// check labels
-	if !translate.LabelsEqual(vObj.Namespace, vObj.Labels, pObj.Labels) {
-		if updated == nil {
-			updated = pObj.DeepCopy()
-		}
-		updated.Labels = translate.TranslateLabels(vObj.Namespace, vObj.Labels)
-	}
-
-	// check description
-	if vObj.Description != pObj.Description {
-		if updated == nil {
-			updated = pObj.DeepCopy()
-		}
-		updated.Description = vObj.Description
-	}
-
-	// check value
-	translatedValue := vObj.Value
-	if translatedValue > 1000000000 {
-		translatedValue = 1000000000
-	}
-	if translatedValue != pObj.Value {
-		if updated == nil {
-			updated = pObj.DeepCopy()
-		}
-		updated.Value = translatedValue
-	}
-
-	return updated, nil
-}
-
-func (s *syncer) BackwardUpdate(ctx context.Context, pObj client.Object, vObj client.Object, log loghelper.Logger) (ctrl.Result, error) {
-	return ctrl.Result{}, nil
-}
-
-func (s *syncer) BackwardUpdateNeeded(pObj client.Object, vObj client.Object) (bool, error) {
-	return false, nil
-}
-
-func (s *syncer) PhysicalName(name string, obj runtime.Object) string {
-	return TranslatePriorityClassName(name, s.targetNamespace)
-}
-
-func TranslatePriorityClassName(name, namespace string) string {
+func translatePriorityClassName(physicalNamespace, name string) string {
 	// we have to prefix with vcluster as system is reserved
-	return translate.PhysicalNameClusterScoped(name, namespace)
+	return translate.PhysicalNameClusterScoped(name, physicalNamespace)
 }

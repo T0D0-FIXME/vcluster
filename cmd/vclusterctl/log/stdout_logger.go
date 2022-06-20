@@ -2,10 +2,11 @@ package log
 
 import (
 	"fmt"
-	"github.com/loft-sh/vcluster/cmd/vclusterctl/log/survey"
 	"io"
 	"os"
 	"sync"
+
+	"github.com/loft-sh/vcluster/cmd/vclusterctl/log/survey"
 
 	goansi "github.com/k0kubun/go-ansi"
 	"github.com/mgutz/ansi"
@@ -35,49 +36,49 @@ type fnTypeInformation struct {
 
 var fnTypeInformationMap = map[logFunctionType]*fnTypeInformation{
 	debugFn: {
-		tag:      "[debug]  ",
+		tag:      "debug  ",
 		color:    "green+b",
 		logLevel: logrus.DebugLevel,
 		stream:   stdout,
 	},
 	infoFn: {
-		tag:      "[info]   ",
+		tag:      "info   ",
 		color:    "cyan+b",
 		logLevel: logrus.InfoLevel,
 		stream:   stdout,
 	},
 	warnFn: {
-		tag:      "[warn]   ",
+		tag:      "warn   ",
 		color:    "red+b",
 		logLevel: logrus.WarnLevel,
 		stream:   stdout,
 	},
 	errorFn: {
-		tag:      "[error]  ",
+		tag:      "error  ",
 		color:    "red+b",
 		logLevel: logrus.ErrorLevel,
 		stream:   stdout,
 	},
 	fatalFn: {
-		tag:      "[fatal]  ",
+		tag:      "fatal  ",
 		color:    "red+b",
 		logLevel: logrus.FatalLevel,
 		stream:   stdout,
 	},
 	panicFn: {
-		tag:      "[panic]  ",
+		tag:      "panic  ",
 		color:    "red+b",
 		logLevel: logrus.PanicLevel,
 		stream:   stderr,
 	},
 	doneFn: {
-		tag:      "[done] √ ",
+		tag:      "done √ ",
 		color:    "green+b",
 		logLevel: logrus.InfoLevel,
 		stream:   stdout,
 	},
 	failFn: {
-		tag:      "[fail] X ",
+		tag:      "fail X ",
 		color:    "red+b",
 		logLevel: logrus.ErrorLevel,
 		stream:   stdout,
@@ -91,8 +92,8 @@ func (s *stdoutLogger) writeMessage(fnType logFunctionType, message string) {
 			s.loadingText.Stop()
 		}
 
-		fnInformation.stream.Write([]byte(ansi.Color(fnInformation.tag, fnInformation.color)))
-		fnInformation.stream.Write([]byte(message))
+		_, _ = fnInformation.stream.Write([]byte(ansi.Color(fnInformation.tag, fnInformation.color)))
+		_, _ = fnInformation.stream.Write([]byte(message))
 
 		if s.loadingText != nil && fnType != fatalFn {
 			s.loadingText.Start()
@@ -421,7 +422,7 @@ func (s *stdoutLogger) WriteString(message string) {
 			s.loadingText.Stop()
 		}
 
-		fnTypeInformationMap[infoFn].stream.Write([]byte(message))
+		_, _ = fnTypeInformationMap[infoFn].stream.Write([]byte(message))
 
 		if s.loadingText != nil {
 			s.loadingText.Start()

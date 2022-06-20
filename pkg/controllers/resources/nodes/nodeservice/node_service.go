@@ -2,11 +2,12 @@ package nodeservice
 
 import (
 	"context"
-	"fmt"
-	"github.com/loft-sh/vcluster/pkg/util/clienthelper"
+	"strings"
+	"sync"
+	"time"
+
 	"github.com/loft-sh/vcluster/pkg/util/translate"
 	"github.com/pkg/errors"
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -16,8 +17,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sync"
-	"time"
 )
 
 var (
@@ -39,22 +38,25 @@ type NodeServiceProvider interface {
 	GetNodeIP(ctx context.Context, name types.NamespacedName) (string, error)
 }
 
-func NewNodeServiceProvider(localClient client.Client, virtualClient client.Client, uncachedVirtualClient client.Client, targetNamespace string) NodeServiceProvider {
+func NewNodeServiceProvider(serviceName, currentNamespace string, currentNamespaceClient client.Client, virtualClient client.Client, uncachedVirtualClient client.Client) NodeServiceProvider {
 	return &nodeServiceProvider{
-		localClient:           localClient,
-		virtualClient:         virtualClient,
-		uncachedVirtualClient: uncachedVirtualClient,
-		targetNamespace:       targetNamespace,
+		serviceName:            serviceName,
+		currentNamespace:       currentNamespace,
+		currentNamespaceClient: currentNamespaceClient,
+		virtualClient:          virtualClient,
+		uncachedVirtualClient:  uncachedVirtualClient,
 	}
 }
 
 type nodeServiceProvider struct {
-	localClient           client.Client
+	serviceName            string
+	currentNamespace       string
+	currentNamespaceClient client.Client
+
 	virtualClient         client.Client
 	uncachedVirtualClient client.Client
 
-	targetNamespace string
-	serviceMutex    sync.Mutex
+	serviceMutex sync.Mutex
 }
 
 func (n *nodeServiceProvider) Start(ctx context.Context) {
@@ -71,7 +73,7 @@ func (n *nodeServiceProvider) cleanupNodeServices(ctx context.Context) error {
 	defer n.serviceMutex.Unlock()
 
 	serviceList := &corev1.ServiceList{}
-	err := n.localClient.List(ctx, serviceList, client.InNamespace(n.targetNamespace), client.MatchingLabels{
+	err := n.currentNamespaceClient.List(ctx, serviceList, client.InNamespace(n.currentNamespace), client.MatchingLabels{
 		ServiceClusterLabel: translate.Suffix,
 	})
 	if err != nil {
@@ -85,7 +87,7 @@ func (n *nodeServiceProvider) cleanupNodeServices(ctx context.Context) error {
 			// check if node still exists
 			err = n.virtualClient.Get(ctx, client.ObjectKey{Name: s.Labels[ServiceNodeLabel]}, &corev1.Node{})
 			if err != nil {
-				if kerrors.IsNotFound(err) == false {
+				if !kerrors.IsNotFound(err) {
 					klog.Infof("error retrieving node %s: %v", s.Labels[ServiceNodeLabel], err)
 					continue
 				}
@@ -100,9 +102,9 @@ func (n *nodeServiceProvider) cleanupNodeServices(ctx context.Context) error {
 			}
 		}
 
-		if exist == false {
+		if !exist {
 			klog.Infof("Cleaning up kubelet service for node %s", s.Labels[ServiceNodeLabel])
-			err = n.localClient.Delete(ctx, &s)
+			err = n.currentNamespaceClient.Delete(ctx, &s)
 			if err != nil {
 				errors = append(errors, err)
 			}
@@ -121,47 +123,28 @@ func (n *nodeServiceProvider) Unlock() {
 }
 
 func (n *nodeServiceProvider) GetNodeIP(ctx context.Context, name types.NamespacedName) (string, error) {
-	serviceList := &corev1.ServiceList{}
-	err := n.localClient.List(ctx, serviceList, client.InNamespace(n.targetNamespace), client.MatchingLabels{
-		ServiceClusterLabel: translate.Suffix,
-		ServiceNodeLabel:    name.Name,
-	})
-	if err != nil {
-		return "", errors.Wrap(err, "list services")
-	} else if len(serviceList.Items) > 0 {
-		return serviceList.Items[0].Spec.ClusterIP, nil
-	}
+	serviceName := translate.SafeConcatName(translate.Suffix, "node", strings.Replace(name.Name, ".", "-", -1))
 
-	// create a new service if we can't find one
-	podName, err := clienthelper.CurrentPodName()
-	if err != nil {
-		return "", errors.Wrap(err, "get current pod name")
+	service := &corev1.Service{}
+	err := n.currentNamespaceClient.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: n.currentNamespace}, service)
+	if err != nil && !kerrors.IsNotFound(err) {
+		return "", errors.Wrap(err, "list services")
+	} else if err == nil {
+		return service.Spec.ClusterIP, nil
 	}
 
 	// find out the labels to select ourself
-	pod := &corev1.Pod{}
-	err = n.localClient.Get(ctx, types.NamespacedName{Name: podName, Namespace: n.targetNamespace}, pod)
+	vclusterService := &corev1.Service{}
+	err = n.currentNamespaceClient.Get(ctx, types.NamespacedName{Name: n.serviceName, Namespace: n.currentNamespace}, vclusterService)
 	if err != nil {
-		return "", errors.Wrap(err, "get pod")
-	} else if len(pod.Labels) == 0 {
-		return "", fmt.Errorf("vcluster pod has no labels to select it")
-	}
-
-	// create label selector
-	labelSelector := map[string]string{}
-	for k, v := range pod.Labels {
-		if k == "controller-revision-hash" || k == "statefulset.kubernetes.io/pod-name" || k == "pod-template-hash" {
-			continue
-		}
-
-		labelSelector[k] = v
+		return "", errors.Wrap(err, "get vcluster service")
 	}
 
 	// create the new service
 	nodeService := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace:    n.targetNamespace,
-			GenerateName: translate.SafeConcatGenerateName(translate.Suffix, "node") + "-",
+			Namespace: n.currentNamespace,
+			Name:      serviceName,
 			Labels: map[string]string{
 				ServiceClusterLabel: translate.Suffix,
 				ServiceNodeLabel:    name.Name,
@@ -174,25 +157,18 @@ func (n *nodeServiceProvider) GetNodeIP(ctx context.Context, name types.Namespac
 					TargetPort: intstr.FromInt(KubeletTargetPort),
 				},
 			},
-			Selector: labelSelector,
+			Selector: vclusterService.Spec.Selector,
 		},
 	}
 
-	// set owning stateful set if defined
-	if translate.OwningStatefulSet != nil {
-		nodeService.SetOwnerReferences([]metav1.OwnerReference{
-			{
-				APIVersion: appsv1.SchemeGroupVersion.String(),
-				Kind:       "StatefulSet",
-				Name:       translate.OwningStatefulSet.Name,
-				UID:        translate.OwningStatefulSet.UID,
-			},
-		})
+	// set owner if defined
+	if translate.Owner != nil {
+		nodeService.SetOwnerReferences(translate.GetOwnerReference(nil))
 	}
 
 	// create the service
 	klog.Infof("Generating kubelet service for node %s", name.Name)
-	err = n.localClient.Create(ctx, nodeService)
+	err = n.currentNamespaceClient.Create(ctx, nodeService)
 	if err != nil {
 		return "", errors.Wrap(err, "create node service")
 	}

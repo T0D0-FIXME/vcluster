@@ -3,27 +3,20 @@ package cert
 import (
 	"context"
 	"fmt"
+	"reflect"
+	"sort"
+	"sync"
+	"time"
+
 	ctrlcontext "github.com/loft-sh/vcluster/cmd/vcluster/context"
 	"github.com/loft-sh/vcluster/pkg/controllers/resources/nodes/nodeservice"
 	"github.com/loft-sh/vcluster/pkg/util/translate"
-	"github.com/pkg/errors"
-	"io/ioutil"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apiserver/pkg/server/dynamiccertificates"
 	"k8s.io/klog"
-	"os"
-	"path/filepath"
-	"reflect"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sort"
-	"sync"
-	"time"
-)
-
-var (
-	certPath = "/var/lib/vcluster/tls"
 )
 
 type Syncer interface {
@@ -32,32 +25,19 @@ type Syncer interface {
 	dynamiccertificates.CertKeyContentProvider
 }
 
-func NewSyncer(ctx *ctrlcontext.ControllerContext) (Syncer, error) {
-	localClient := ctx.LocalManager.GetClient()
-	if ctx.Options.ServiceNamespace != ctx.Options.TargetNamespace {
-		var err error
-		localClient, err = client.New(ctx.LocalManager.GetConfig(), client.Options{
-			Scheme: ctx.LocalManager.GetScheme(),
-			Mapper: ctx.LocalManager.GetRESTMapper(),
-		})
-		if err != nil {
-			return nil, errors.Wrap(err, "create uncached client")
-		}
-	}
-
+func NewSyncer(currentNamespace string, currentNamespaceClient client.Client, options *ctrlcontext.VirtualClusterOptions) (Syncer, error) {
 	return &syncer{
-		clusterDomain: ctx.Options.ClusterDomain,
+		clusterDomain: options.ClusterDomain,
 
-		serverCaKey:  ctx.Options.ServerCaKey,
-		serverCaCert: ctx.Options.ServerCaCert,
+		serverCaKey:  options.ServerCaKey,
+		serverCaCert: options.ServerCaCert,
 
-		addSANs:          ctx.Options.TlsSANs,
-		listeners:        []dynamiccertificates.Listener{},
-		serviceName:      ctx.Options.ServiceName,
-		serviceNamespace: ctx.Options.ServiceNamespace,
+		addSANs:   options.TLSSANs,
+		listeners: []dynamiccertificates.Listener{},
 
-		vClient: ctx.VirtualManager.GetClient(),
-		pClient: localClient,
+		serviceName:           options.ServiceName,
+		currentNamespace:      currentNamespace,
+		currentNamespaceCient: currentNamespaceClient,
 	}, nil
 }
 
@@ -69,11 +49,9 @@ type syncer struct {
 
 	addSANs []string
 
-	serviceName      string
-	serviceNamespace string
-
-	vClient client.Client
-	pClient client.Client
+	serviceName           string
+	currentNamespace      string
+	currentNamespaceCient client.Client
 
 	listeners []dynamiccertificates.Listener
 
@@ -106,14 +84,14 @@ func (s *syncer) getSANs() ([]string, error) {
 
 	// get cluster ip of target service
 	svc := &corev1.Service{}
-	err := s.pClient.Get(context.TODO(), types.NamespacedName{
-		Namespace: s.serviceNamespace,
+	err := s.currentNamespaceCient.Get(context.TODO(), types.NamespacedName{
+		Namespace: s.currentNamespace,
 		Name:      s.serviceName,
 	}, svc)
 	if err != nil {
-		return nil, fmt.Errorf("error getting vcluster service %s/%s: %v", s.serviceNamespace, s.serviceName, err)
+		return nil, fmt.Errorf("error getting vcluster service %s/%s: %v", s.currentNamespace, s.serviceName, err)
 	} else if svc.Spec.ClusterIP == "" {
-		return nil, fmt.Errorf("target service %s/%s is missing a clusterIP", s.serviceNamespace, s.serviceName)
+		return nil, fmt.Errorf("target service %s/%s is missing a clusterIP", s.currentNamespace, s.serviceName)
 	}
 
 	// get load balancer ip
@@ -130,7 +108,7 @@ func (s *syncer) getSANs() ([]string, error) {
 
 	// get cluster ips of node services
 	svcs := &corev1.ServiceList{}
-	err = s.pClient.List(context.TODO(), svcs, client.InNamespace(s.serviceNamespace), client.MatchingLabels{nodeservice.ServiceClusterLabel: translate.Suffix})
+	err = s.currentNamespaceCient.List(context.TODO(), svcs, client.InNamespace(s.currentNamespace), client.MatchingLabels{nodeservice.ServiceClusterLabel: translate.Suffix})
 	if err != nil {
 		return nil, err
 	}
@@ -149,7 +127,7 @@ func (s *syncer) getSANs() ([]string, error) {
 	return retSANs, nil
 }
 
-func (s *syncer) RunOnce() error {
+func (s *syncer) RunOnce(ctx context.Context) error {
 	s.currentCertMutex.Lock()
 	defer s.currentCertMutex.Unlock()
 
@@ -162,34 +140,21 @@ func (s *syncer) RunOnce() error {
 }
 
 func (s *syncer) regen(extraSANs []string) error {
-	err := os.MkdirAll(certPath, 0755)
-	if err != nil {
-		return err
-	}
-
 	klog.Infof("Generating serving cert for service ips: %v", extraSANs)
-	tlsCert := filepath.Join(certPath, "serving-tls.crt")
-	tlsKey := filepath.Join(certPath, "serving-tls.key")
-	_, err = GenServingCerts(s.serverCaCert, s.serverCaKey, tlsCert, tlsKey, s.clusterDomain, extraSANs)
-	if err != nil {
-		return err
-	}
 
-	s.currentCert, err = ioutil.ReadFile(tlsCert)
+	// GenServingCerts will write generated or updated cert/key to s.currentCert, s.currentKey
+	cert, key, _, err := GenServingCerts(s.serverCaCert, s.serverCaKey, s.currentCert, s.currentKey, s.clusterDomain, extraSANs)
 	if err != nil {
 		return err
 	}
-
-	s.currentKey, err = ioutil.ReadFile(tlsKey)
-	if err != nil {
-		return err
-	}
+	s.currentCert = cert
+	s.currentKey = key
 
 	s.currentSANs = extraSANs
 	return nil
 }
 
-func (s *syncer) Run(workers int, stopCh <-chan struct{}) {
+func (s *syncer) Run(ctx context.Context, workers int) {
 	wait.JitterUntil(func() {
 		extraSANs, err := s.getSANs()
 		if err != nil {
@@ -200,7 +165,7 @@ func (s *syncer) Run(workers int, stopCh <-chan struct{}) {
 		s.currentCertMutex.Lock()
 		defer s.currentCertMutex.Unlock()
 
-		if reflect.DeepEqual(extraSANs, s.currentSANs) == false {
+		if !reflect.DeepEqual(extraSANs, s.currentSANs) {
 			err = s.regen(extraSANs)
 			if err != nil {
 				klog.Infof("Error regenerating certificate: %v", err)
@@ -211,5 +176,5 @@ func (s *syncer) Run(workers int, stopCh <-chan struct{}) {
 				l.Enqueue()
 			}
 		}
-	}, time.Second*2, 1.25, true, stopCh)
+	}, time.Second*2, 1.25, true, ctx.Done())
 }

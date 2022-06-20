@@ -22,7 +22,11 @@ This is just a short list of ideas, if you have other ideas for contributing ple
 
 We recommend to develop vcluster directly in a Kubernetes cluster as it makes feedback a lot quicker. For the quick setup, you'll need to install [devspace](https://github.com/loft-sh/devspace#1-install-devspace), docker, kubectl, helm and make sure you have a local Kubernetes cluster (such as Docker Desktop, minikube, KinD or similar) installed.
 
-Clone the vcluster project into a new folder and make sure the variable `SERIVE_CIDR` in the `devspace.yaml` fits your local clusters service cidr. You can find out the service cidr with:
+Fork and clone the repo:
+- Click Fork button (top right) to establish a cloud-based fork.
+- git clone your-fork-url
+
+After cloning make sure the variable `SERVICE_CIDR` in the `devspace.yaml` fits your local clusters service cidr. You can find out the service cidr with:
 
 ```
 kubectl create -f ./hack/wrong-cluster-ip-service.yaml 
@@ -74,10 +78,10 @@ root@vcluster-0:/vcluster#
 
 Then you can start vcluster with
 ```
-go run -mod vendor cmd/vcluster/main.go
+go run -mod vendor cmd/vcluster/main.go start
 ```
 
-Now if you change a file locally, DevSpace will automatically sync the file into the container and you just have to rerun `go run -mod vendor cmd/vcluster/main.go` within the terminal to apply the changes.
+Now if you change a file locally, DevSpace will automatically sync the file into the container and you just have to rerun `go run -mod vendor cmd/vcluster/main.go start` within the terminal to apply the changes.
 
 You can access the vcluster by running `devspace enter` in a separate terminal:
 
@@ -97,9 +101,23 @@ root@vcluster-0:/vcluster#
 
 `kubectl` within the syncer container will point to the virtual cluster and you can access it from there. If you need to recreate the vcluster, delete the `vcluster` namespace and rerun `devspace run dev` again. 
 
+#### Debug vcluster with Delve
+If you wish to run vcluster in the debug mode with delve, run `devspace run dev` and wait until you see the command prompt (`root@vcluster-0:/vcluster#`).  
+Run `dlv debug ./cmd/vcluster/main.go --listen=0.0.0.0:2345 --api-version=2 --output /tmp/__debug_bin --headless --build-flags="-mod=vendor" -- --lease-duration=99999`  
+Wait until the `API server listening at: [::]:2345` message appears.  
+Start the `Debug vcluster (localhost:2346)` configuration in VSCode to connect your debugger session.  
+If you are not using VSCode, configure your IDE to connect to `localhost:2346` for the "remote" delve debugging.  
+**Note:** vcluster won't start until you connect with the debugger.  
+**Note:** vcluster will be stopped once you detach your debugger session.  
+
 ### Running vcluster Tests
 
-You can run the unit test suite with `./hack/test.sh` which should execute all the vcluster tests. For running conformance tests, please take a look at [conformance tests](https://github.com/loft-sh/vcluster/tree/main/conformance/v1.20)
+You can run the unit test suite with `./hack/test.sh` which should execute all the vcluster tests.  
+
+The e2e test suite can be run from the e2e folder(`cd e2e`) with this command - `go test -v -ginkgo.v`.  
+Alternatively, if you [install ginkgo binary](https://github.com/onsi/ginkgo#global-installation), you can run it with `ginkgo -v`.
+
+For running conformance tests, please take a look at [conformance tests](https://github.com/loft-sh/vcluster/tree/main/conformance/v1.21)
 
 ### License
 

@@ -13,7 +13,6 @@ export GOFLAGS=-mod=vendor
 # go mod vendor
 
 VCLUSTER_ROOT=$(git rev-parse --show-toplevel)
-VERSION=$(git describe --tags $(git rev-list --tags --max-count=1))
 COMMIT_HASH=$(git rev-parse --short HEAD 2>/dev/null)
 DATE=$(date "+%Y-%m-%d")
 BUILD_PLATFORM=$(uname -a | awk '{print tolower($1);}')
@@ -29,7 +28,7 @@ if [[ "$(pwd)" != "${VCLUSTER_ROOT}" ]]; then
 fi
 
 GO_BUILD_CMD="go build -a"
-GO_BUILD_LDFLAGS="-s -w -X main.commitHash=${COMMIT_HASH} -X main.buildDate=${DATE} -X main.version=${VERSION}"
+GO_BUILD_LDFLAGS="-s -w -X main.commitHash=${COMMIT_HASH} -X main.buildDate=${DATE} -X main.version=${RELEASE_VERSION}"
 
 if [[ -z "${VCLUSTER_BUILD_PLATFORMS}" ]]; then
     VCLUSTER_BUILD_PLATFORMS="linux windows darwin"
@@ -41,6 +40,12 @@ fi
 
 # Create the release directory
 mkdir -p "${VCLUSTER_ROOT}/release"
+
+# copy assets
+cp -a "${VCLUSTER_ROOT}/assets/." "${VCLUSTER_ROOT}/release/"
+
+# generate vcluster-images.txt
+go run -mod vendor "${VCLUSTER_ROOT}/hack/assets/main.go" ${RELEASE_VERSION} > "${VCLUSTER_ROOT}/release/vcluster-images.txt"
 
 for OS in ${VCLUSTER_BUILD_PLATFORMS[@]}; do
   for ARCH in ${VCLUSTER_BUILD_ARCHS[@]}; do
@@ -64,6 +69,7 @@ for OS in ${VCLUSTER_BUILD_PLATFORMS[@]}; do
     echo "Building for ${OS}/${ARCH}"
     GOARCH=${ARCH} GOOS=${OS} ${GO_BUILD_CMD} -ldflags "${GO_BUILD_LDFLAGS}"\
       -o "${VCLUSTER_ROOT}/release/${NAME}" cmd/vclusterctl/main.go
-    shasum -a 256 "${VCLUSTER_ROOT}/release/${NAME}" > "${VCLUSTER_ROOT}/release/${NAME}".sha256
+    shasum -a 256 "${VCLUSTER_ROOT}/release/${NAME}" | cut -d ' ' -f 1 > "${VCLUSTER_ROOT}/release/${NAME}".sha256
+    COSIGN_EXPERIMENTAL=1 cosign sign-blob --output-signature "${VCLUSTER_ROOT}/release/${NAME}".sha256.sig --output-certificate "${VCLUSTER_ROOT}/release/${NAME}".sha256.pem "${VCLUSTER_ROOT}/release/${NAME}".sha256
   done
 done

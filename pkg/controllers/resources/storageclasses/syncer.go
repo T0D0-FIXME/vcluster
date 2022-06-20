@@ -1,84 +1,74 @@
 package storageclasses
 
 import (
-	"context"
-	context2 "github.com/loft-sh/vcluster/cmd/vcluster/context"
-	"github.com/loft-sh/vcluster/pkg/controllers/resources/generic"
-	"github.com/loft-sh/vcluster/pkg/util/loghelper"
+	"github.com/loft-sh/vcluster/pkg/constants"
+	"github.com/loft-sh/vcluster/pkg/controllers/syncer"
+	synccontext "github.com/loft-sh/vcluster/pkg/controllers/syncer/context"
+	"github.com/loft-sh/vcluster/pkg/controllers/syncer/translator"
+	"github.com/loft-sh/vcluster/pkg/util/translate"
 	storagev1 "k8s.io/api/storage/v1"
-	"k8s.io/apimachinery/pkg/api/equality"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-func RegisterSyncer(ctx *context2.ControllerContext) error {
-	return generic.RegisterOneWayClusterSyncer(ctx, &syncer{
-		localClient:   ctx.LocalManager.GetClient(),
-		virtualClient: ctx.VirtualManager.GetClient(),
-	}, "storageclass")
+var (
+	DefaultStorageClassAnnotation = "storageclass.kubernetes.io/is-default-class"
+)
+
+func New(ctx *synccontext.RegisterContext) (syncer.Object, error) {
+	return &storageClassSyncer{
+		Translator: translator.NewClusterTranslator(ctx, "storageclass", &storagev1.StorageClass{}, NewStorageClassTranslator(ctx.Options.TargetNamespace), DefaultStorageClassAnnotation),
+	}, nil
 }
 
-type syncer struct {
-	localClient   client.Client
-	virtualClient client.Client
+type storageClassSyncer struct {
+	translator.Translator
 }
 
-func (s *syncer) New() client.Object {
-	return &storagev1.StorageClass{}
+var _ syncer.IndicesRegisterer = &storageClassSyncer{}
+
+func (s *storageClassSyncer) RegisterIndices(ctx *synccontext.RegisterContext) error {
+	return ctx.VirtualManager.GetFieldIndexer().IndexField(ctx.Context, &storagev1.StorageClass{}, constants.IndexByPhysicalName, func(rawObj client.Object) []string {
+		return []string{translateStorageClassName(ctx.Options.TargetNamespace, rawObj.GetName())}
+	})
 }
 
-func (s *syncer) NewList() client.ObjectList {
-	return &storagev1.StorageClassList{}
-}
+var _ syncer.Syncer = &storageClassSyncer{}
 
-func (s *syncer) BackwardCreate(ctx context.Context, pObj client.Object, log loghelper.Logger) (ctrl.Result, error) {
-	pStorageClass := pObj.(*storagev1.StorageClass)
-
-	vObj := pStorageClass.DeepCopy()
-	vObj.ResourceVersion = ""
-	vObj.UID = ""
-	vObj.ManagedFields = nil
-	log.Infof("create storage class %s, because it is not exist in virtual cluster", vObj.Name)
-	return ctrl.Result{}, s.virtualClient.Create(ctx, vObj)
-}
-
-func (s *syncer) BackwardCreateNeeded(pObj client.Object) (bool, error) {
-	return true, nil
-}
-
-func (s *syncer) BackwardUpdate(ctx context.Context, pObj client.Object, vObj client.Object, log loghelper.Logger) (ctrl.Result, error) {
-	pStorageClass := pObj.(*storagev1.StorageClass)
-	vStorageClass := vObj.(*storagev1.StorageClass)
-
-	// check if there is a change
-	newObj := calcSCDiff(pStorageClass, vStorageClass)
-	if newObj != nil {
-		log.Infof("update storage class %s", vStorageClass.Name)
-		return ctrl.Result{}, s.virtualClient.Update(ctx, newObj)
+func (s *storageClassSyncer) Sync(ctx *synccontext.SyncContext, pObj client.Object, vObj client.Object) (ctrl.Result, error) {
+	// did the storage class change?
+	updated := s.translateUpdate(pObj.(*storagev1.StorageClass), vObj.(*storagev1.StorageClass))
+	if updated != nil {
+		ctx.Log.Infof("updating physical storage class %s, because virtual storage class has changed", updated.Name)
+		translator.PrintChanges(pObj, updated, ctx.Log)
+		err := ctx.PhysicalClient.Update(ctx.Context, updated)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	return ctrl.Result{}, nil
 }
 
-func (s *syncer) BackwardUpdateNeeded(pObj client.Object, vObj client.Object) (bool, error) {
-	pStorageClass := pObj.(*storagev1.StorageClass)
-	vStorageClass := vObj.(*storagev1.StorageClass)
-
-	// check if there is a change
-	newObj := calcSCDiff(pStorageClass, vStorageClass)
-	if newObj != nil {
-		return true, nil
+func (s *storageClassSyncer) SyncDown(ctx *synccontext.SyncContext, vObj client.Object) (ctrl.Result, error) {
+	newStorageClass := s.translate(vObj.(*storagev1.StorageClass))
+	ctx.Log.Infof("create physical storage class %s", newStorageClass.Name)
+	err := ctx.PhysicalClient.Create(ctx.Context, newStorageClass)
+	if err != nil {
+		ctx.Log.Infof("error syncing %s to physical cluster: %v", vObj.GetName(), err)
+		return ctrl.Result{}, err
 	}
 
-	return false, nil
+	return ctrl.Result{}, nil
 }
 
-func calcSCDiff(pObj, vObj *storagev1.StorageClass) *storagev1.StorageClass {
-	pObjCopy := pObj.DeepCopy()
-	pObjCopy.ObjectMeta = vObj.ObjectMeta
-	pObjCopy.TypeMeta = vObj.TypeMeta
-	if !equality.Semantic.DeepEqual(vObj, pObjCopy) {
-		return pObjCopy
+func NewStorageClassTranslator(physicalNamespace string) translator.PhysicalNameTranslator {
+	return func(vName string, vObj client.Object) string {
+		return translateStorageClassName(physicalNamespace, vName)
 	}
-	return nil
+}
+
+func translateStorageClassName(physicalNamespace, name string) string {
+	// we have to prefix with vcluster as system is reserved
+	return translate.PhysicalNameClusterScoped(name, physicalNamespace)
 }

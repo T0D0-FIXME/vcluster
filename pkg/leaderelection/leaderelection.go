@@ -6,7 +6,6 @@ import (
 	"github.com/loft-sh/vcluster/pkg/util/translate"
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	clientv1 "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -29,7 +28,7 @@ func StartLeaderElection(ctx *context2.ControllerContext, scheme *runtime.Scheme
 	}
 	eventBroadcaster := record.NewBroadcaster()
 	eventBroadcaster.StartLogging(func(format string, args ...interface{}) { klog.Infof(format, args...) })
-	eventBroadcaster.StartRecordingToSink(&clientv1.EventSinkImpl{Interface: recorderClient.CoreV1().Events(ctx.Options.TargetNamespace)})
+	eventBroadcaster.StartRecordingToSink(&clientv1.EventSinkImpl{Interface: recorderClient.CoreV1().Events(ctx.CurrentNamespace)})
 	recorder := eventBroadcaster.NewRecorder(scheme, corev1.EventSource{Component: "vcluster"})
 
 	// create the leader election client
@@ -45,21 +44,24 @@ func StartLeaderElection(ctx *context2.ControllerContext, scheme *runtime.Scheme
 	}
 
 	// Lock required for leader election
-	rl := resourcelock.ConfigMapLock{
-		ConfigMapMeta: metav1.ObjectMeta{
-			Namespace: ctx.Options.TargetNamespace,
-			Name:      translate.SafeConcatName("vcluster", translate.Suffix, "controller"),
-		},
-		Client: leaderElectionClient.CoreV1(),
-		LockConfig: resourcelock.ResourceLockConfig{
+	rl, err := resourcelock.New(
+		resourcelock.ConfigMapsLeasesResourceLock,
+		ctx.CurrentNamespace,
+		translate.SafeConcatName("vcluster", translate.Suffix, "controller"),
+		leaderElectionClient.CoreV1(),
+		leaderElectionClient.CoordinationV1(),
+		resourcelock.ResourceLockConfig{
 			Identity:      id + "-external-vcluster-controller",
 			EventRecorder: recorder,
 		},
+	)
+	if err != nil {
+		return err
 	}
 
 	// try and become the leader and start controller manager loops
 	leaderelection.RunOrDie(ctx.Context, leaderelection.LeaderElectionConfig{
-		Lock:          &rl,
+		Lock:          rl,
 		LeaseDuration: time.Duration(ctx.Options.LeaseDuration) * time.Second,
 		RenewDeadline: time.Duration(ctx.Options.RenewDeadline) * time.Second,
 		RetryPeriod:   time.Duration(ctx.Options.RetryPeriod) * time.Second,

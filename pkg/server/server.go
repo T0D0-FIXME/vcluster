@@ -2,22 +2,34 @@ package server
 
 import (
 	"context"
-	"crypto/tls"
-	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"strconv"
+	"time"
+
 	context2 "github.com/loft-sh/vcluster/cmd/vcluster/context"
 	"github.com/loft-sh/vcluster/pkg/authentication/delegatingauthenticator"
 	"github.com/loft-sh/vcluster/pkg/authorization/allowall"
 	"github.com/loft-sh/vcluster/pkg/authorization/delegatingauthorizer"
 	"github.com/loft-sh/vcluster/pkg/authorization/impersonationauthorizer"
 	"github.com/loft-sh/vcluster/pkg/authorization/kubeletauthorizer"
+	"github.com/loft-sh/vcluster/pkg/constants"
+	"github.com/loft-sh/vcluster/pkg/controllers/resources/nodes/nodeservice"
+	"github.com/loft-sh/vcluster/pkg/controllers/syncer/translator"
 	"github.com/loft-sh/vcluster/pkg/server/cert"
 	"github.com/loft-sh/vcluster/pkg/server/filters"
 	"github.com/loft-sh/vcluster/pkg/server/handler"
+	"github.com/loft-sh/vcluster/pkg/util/blockingcacheclient"
+	"github.com/loft-sh/vcluster/pkg/util/pluginhookclient"
 	"github.com/loft-sh/vcluster/pkg/util/serverhelper"
+	"github.com/loft-sh/vcluster/pkg/util/translate"
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
-	utilnet "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apiserver/pkg/admission"
 	"k8s.io/apiserver/pkg/admission/initializer"
@@ -36,41 +48,92 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/klog"
 	aggregatorapiserver "k8s.io/kube-aggregator/pkg/apiserver"
-	"net"
-	"net/http"
-	ctrl "sigs.k8s.io/controller-runtime"
-	"strconv"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // Server is a http.Handler which proxies Kubernetes APIs to remote API server.
 type Server struct {
-	virtualManager ctrl.Manager
-	localManager   ctrl.Manager
-	certSyncer     cert.Syncer
-	handler        *http.ServeMux
+	uncachedVirtualClient client.Client
+
+	currentNamespace       string
+	currentNamespaceClient client.Client
+
+	certSyncer cert.Syncer
+	handler    *http.ServeMux
 
 	redirectResources   []delegatingauthorizer.GroupVersionResourceVerb
 	requestHeaderCaFile string
 	clientCaFile        string
-
-	targetNamespace string
 }
 
 // NewServer creates and installs a new Server.
 // 'filter', if non-nil, protects requests to the api only.
 func NewServer(ctx *context2.ControllerContext, requestHeaderCaFile, clientCaFile string) (*Server, error) {
-	certSyncer, err := cert.NewSyncer(ctx)
+	localConfig := ctx.LocalManager.GetConfig()
+	virtualConfig := ctx.VirtualManager.GetConfig()
+	uncachedLocalClient, err := client.New(localConfig, client.Options{
+		Scheme: ctx.LocalManager.GetScheme(),
+		Mapper: ctx.LocalManager.GetRESTMapper(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	uncachedVirtualClient, err := client.New(virtualConfig, client.Options{
+		Scheme: ctx.VirtualManager.GetScheme(),
+		Mapper: ctx.VirtualManager.GetRESTMapper(),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	cachedLocalClient, err := createCachedClient(ctx.Context, localConfig, ctx.CurrentNamespace, uncachedLocalClient.RESTMapper(), uncachedLocalClient.Scheme(), func(cache cache.Cache) error {
+		return cache.IndexField(ctx.Context, &corev1.Service{}, constants.IndexByClusterIP, func(object client.Object) []string {
+			svc := object.(*corev1.Service)
+			if len(svc.Labels) == 0 || svc.Labels[nodeservice.ServiceClusterLabel] != translate.Suffix {
+				return nil
+			}
+
+			return []string{svc.Spec.ClusterIP}
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	cachedVirtualClient, err := createCachedClient(ctx.Context, virtualConfig, corev1.NamespaceAll, uncachedVirtualClient.RESTMapper(), uncachedVirtualClient.Scheme(), func(cache cache.Cache) error {
+		err := cache.IndexField(ctx.Context, &corev1.PersistentVolumeClaim{}, constants.IndexByPhysicalName, func(rawObj client.Object) []string {
+			return []string{translator.ObjectPhysicalName(rawObj)}
+		})
+		if err != nil {
+			return err
+		}
+
+		return cache.IndexField(ctx.Context, &corev1.Pod{}, constants.IndexByPhysicalName, func(rawObj client.Object) []string {
+			return []string{translator.ObjectPhysicalName(rawObj)}
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// wrap clients
+	uncachedVirtualClient = pluginhookclient.WrapVirtualClient(uncachedVirtualClient)
+	cachedVirtualClient = pluginhookclient.WrapVirtualClient(cachedVirtualClient)
+	uncachedLocalClient = pluginhookclient.WrapPhysicalClient(uncachedLocalClient)
+	cachedLocalClient = pluginhookclient.WrapPhysicalClient(cachedLocalClient)
+
+	certSyncer, err := cert.NewSyncer(ctx.CurrentNamespace, cachedLocalClient, ctx.Options)
 	if err != nil {
 		return nil, errors.Wrap(err, "create cert syncer")
 	}
 
 	s := &Server{
-		virtualManager: ctx.VirtualManager,
-		localManager:   ctx.LocalManager,
-		certSyncer:     certSyncer,
-		handler:        http.NewServeMux(),
+		uncachedVirtualClient: uncachedVirtualClient,
+		certSyncer:            certSyncer,
+		handler:               http.NewServeMux(),
 
-		targetNamespace: ctx.Options.TargetNamespace,
+		currentNamespace:       ctx.CurrentNamespace,
+		currentNamespaceClient: cachedLocalClient,
 
 		requestHeaderCaFile: requestHeaderCaFile,
 		clientCaFile:        clientCaFile,
@@ -104,19 +167,24 @@ func NewServer(ctx *context2.ControllerContext, requestHeaderCaFile, clientCaFil
 	}
 
 	// init plugins
-	admissionHandler, err := initAdmission(ctx.Context, ctx.VirtualManager.GetConfig())
+	admissionHandler, err := initAdmission(ctx.Context, virtualConfig)
 	if err != nil {
 		return nil, errors.Wrap(err, "init admission")
 	}
 
-	h := handler.ImpersonatingHandler("", ctx.VirtualManager.GetConfig())
-	h = filters.WithServiceCreateRedirect(h, ctx.LocalManager, ctx.VirtualManager, ctx.Options.TargetNamespace)
-	h = filters.WithRedirect(h, ctx.LocalManager, ctx.VirtualManager, admissionHandler, ctx.Options.TargetNamespace, s.redirectResources)
-	h = filters.WithMetricsProxy(h, ctx.LocalManager, ctx.VirtualManager, ctx.Options.TargetNamespace)
-	if ctx.Options.SyncNodeChanges {
-		h = filters.WithNodeChanges(h, ctx.LocalManager, ctx.VirtualManager)
+	h := handler.ImpersonatingHandler("", virtualConfig)
+	h = filters.WithServiceCreateRedirect(h, uncachedLocalClient, uncachedVirtualClient, virtualConfig, ctx.Options.TargetNamespace, ctx.Options.SyncLabels)
+	h = filters.WithRedirect(h, localConfig, uncachedLocalClient.Scheme(), uncachedVirtualClient, admissionHandler, ctx.Options.TargetNamespace, s.redirectResources)
+	h = filters.WithMetricsProxy(h, localConfig, cachedVirtualClient, ctx.Options.TargetNamespace)
+	if ctx.Options.DeprecatedSyncNodeChanges {
+		h = filters.WithNodeChanges(h, uncachedLocalClient, uncachedVirtualClient, virtualConfig)
 	}
-	h = filters.WithFakeKubelet(h, ctx.LocalManager, ctx.VirtualManager, ctx.Options.TargetNamespace)
+	h = filters.WithFakeKubelet(h, localConfig, cachedVirtualClient, ctx.Options.TargetNamespace)
+
+	if os.Getenv("DEBUG") == "true" {
+		h = filters.WithPprof(h)
+	}
+
 	serverhelper.HandleRoute(s.handler, "/", h)
 
 	return s, nil
@@ -125,7 +193,7 @@ func NewServer(ctx *context2.ControllerContext, requestHeaderCaFile, clientCaFil
 // ServeOnListenerTLS starts the server using given listener with TLS, loops forever until an error occurs
 func (s *Server) ServeOnListenerTLS(address string, port int, stopChan <-chan struct{}) error {
 	// kubernetes build handler configuration
-	serverConfig := server.NewConfig(serializer.NewCodecFactory(s.virtualManager.GetScheme()))
+	serverConfig := server.NewConfig(serializer.NewCodecFactory(s.uncachedVirtualClient.Scheme()))
 	serverConfig.RequestInfoResolver = &request.RequestInfoFactory{
 		APIPrefixes:          sets.NewString("api", "apis"),
 		GrouplessAPIPrefixes: sets.NewString("api"),
@@ -143,7 +211,7 @@ func (s *Server) ServeOnListenerTLS(address string, port int, stopChan <-chan st
 		},
 	}
 	redirectAuthResources = append(redirectAuthResources, s.redirectResources...)
-	serverConfig.Authorization.Authorizer = union.New(kubeletauthorizer.New(s.localManager, s.virtualManager), delegatingauthorizer.New(s.virtualManager, redirectAuthResources, nil), impersonationauthorizer.New(s.virtualManager.GetClient()), allowall.New())
+	serverConfig.Authorization.Authorizer = union.New(kubeletauthorizer.New(s.uncachedVirtualClient), delegatingauthorizer.New(s.uncachedVirtualClient, redirectAuthResources, nil), impersonationauthorizer.New(s.uncachedVirtualClient), allowall.New())
 
 	sso := options.NewSecureServingOptions()
 	sso.HTTP2MaxStreamsPerConnection = 1000
@@ -166,11 +234,11 @@ func (s *Server) ServeOnListenerTLS(address string, port int, stopChan <-chan st
 	}
 
 	// make sure the tokens are correctly authenticated
-	serverConfig.Authentication.Authenticator = unionauthentication.New(delegatingauthenticator.New(s.virtualManager.GetClient()), serverConfig.Authentication.Authenticator)
+	serverConfig.Authentication.Authenticator = unionauthentication.New(delegatingauthenticator.New(s.uncachedVirtualClient), serverConfig.Authentication.Authenticator)
 
 	// create server
 	klog.Info("Starting tls proxy server at " + address + ":" + strconv.Itoa(port))
-	stopped, err := serverConfig.SecureServing.Serve(s.buildHandlerChain(serverConfig), serverConfig.RequestTimeout, stopChan)
+	stopped, _, err := serverConfig.SecureServing.Serve(s.buildHandlerChain(serverConfig), serverConfig.RequestTimeout, stopChan)
 	if err != nil {
 		return err
 	}
@@ -179,9 +247,47 @@ func (s *Server) ServeOnListenerTLS(address string, port int, stopChan <-chan st
 	return nil
 }
 
+func createCachedClient(ctx context.Context, config *rest.Config, namespace string, restMapper meta.RESTMapper, scheme *runtime.Scheme, registerIndices func(cache cache.Cache) error) (client.Client, error) {
+	// create the new cache
+	clientCache, err := cache.New(config, cache.Options{
+		Scheme:    scheme,
+		Mapper:    restMapper,
+		Namespace: namespace,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// register indices
+	err = registerIndices(clientCache)
+	if err != nil {
+		return nil, err
+	}
+
+	// start cache
+	go func() {
+		err := clientCache.Start(ctx)
+		if err != nil {
+			panic(err)
+		}
+	}()
+	clientCache.WaitForCacheSync(ctx)
+
+	// create a client from cache
+	cachedVirtualClient, err := blockingcacheclient.NewCacheClient(clientCache, config, client.Options{
+		Scheme: scheme,
+		Mapper: restMapper,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return cachedVirtualClient, nil
+}
+
 func (s *Server) buildHandlerChain(serverConfig *server.Config) http.Handler {
 	defaultHandler := server.DefaultBuildHandlerChain(s.handler, serverConfig)
-	defaultHandler = filters.WithNodeName(defaultHandler, s.localManager, s.targetNamespace)
+	defaultHandler = filters.WithNodeName(defaultHandler, s.currentNamespace, s.currentNamespaceClient)
 	return defaultHandler
 }
 
@@ -192,31 +298,68 @@ func initAdmission(ctx context.Context, vConfig *rest.Config) (admission.Interfa
 	}
 
 	kubeInformerFactory := informers.NewSharedInformerFactory(vClient, 0)
+	serviceResolver := aggregatorapiserver.NewClusterIPServiceResolver(
+		kubeInformerFactory.Core().V1().Services().Lister(),
+	)
+	authInfoResolverWrapper := func(resolver webhook.AuthenticationInfoResolver) webhook.AuthenticationInfoResolver {
+		return &kubeConfigProvider{
+			vConfig: vConfig,
+		}
+	}
+
+	// Register plugins
 	plugins := &admission.Plugins{}
 	mutating.Register(plugins)
 	validating.Register(plugins)
-	webhookAuthResolverWrapper := webhook.NewDefaultAuthenticationInfoResolverWrapper(utilnet.SetTransportDefaults(&http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	}), nil, vConfig)
-	webhookPluginInitializer := webhookinit.NewPluginInitializer(webhookAuthResolverWrapper, aggregatorapiserver.NewClusterIPServiceResolver(
-		kubeInformerFactory.Core().V1().Services().Lister(),
-	))
-	pluginInitializers := []admission.PluginInitializer{webhookPluginInitializer}
-	pluginNames := plugins.Registered()
-	pluginsConfigProvider, err := admission.ReadAdmissionConfiguration(pluginNames, "", nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read plugin config: %v", err)
-	}
 
-	genericInitializer := initializer.New(vClient, kubeInformerFactory, nil, nil)
-	initializersChain := admission.PluginInitializers{}
-	pluginInitializers = append(pluginInitializers, genericInitializer)
-	initializersChain = append(initializersChain, pluginInitializers...)
-	admissionChain, err := plugins.NewFromPlugins(pluginNames, pluginsConfigProvider, initializersChain, nil)
+	// create admission chain
+	admissionChain, err := plugins.NewFromPlugins(
+		plugins.Registered(),
+		&emptyConfigProvider{},
+		admission.PluginInitializers{
+			webhookinit.NewPluginInitializer(authInfoResolverWrapper, serviceResolver),
+			initializer.New(vClient, kubeInformerFactory, nil, nil),
+		},
+		nil,
+	)
 	if err != nil {
 		return nil, err
 	}
 
 	go kubeInformerFactory.Start(ctx.Done())
 	return admissionChain, nil
+}
+
+type kubeConfigProvider struct {
+	vConfig *rest.Config
+}
+
+func (c *kubeConfigProvider) ClientConfigFor(hostPort string) (*rest.Config, error) {
+	return c.clientConfig(hostPort)
+}
+
+func (c *kubeConfigProvider) ClientConfigForService(serviceName, serviceNamespace string, servicePort int) (*rest.Config, error) {
+	return c.clientConfig(net.JoinHostPort(serviceName+"."+serviceNamespace+".svc", strconv.Itoa(servicePort)))
+}
+
+func (c *kubeConfigProvider) clientConfig(target string) (*rest.Config, error) {
+	if target == "kubernetes.default.svc:443" {
+		return setGlobalDefaults(c.vConfig), nil
+	}
+
+	// anonymous
+	return setGlobalDefaults(&rest.Config{}), nil
+}
+
+func setGlobalDefaults(config *rest.Config) *rest.Config {
+	config.UserAgent = "kube-apiserver-admission"
+	config.Timeout = 30 * time.Second
+
+	return config
+}
+
+type emptyConfigProvider struct{}
+
+func (e *emptyConfigProvider) ConfigFor(pluginName string) (io.Reader, error) {
+	return nil, nil
 }

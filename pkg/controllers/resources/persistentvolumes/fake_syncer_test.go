@@ -1,18 +1,14 @@
 package persistentvolumes
 
 import (
-	"context"
-	"strings"
+	synccontext "github.com/loft-sh/vcluster/pkg/controllers/syncer/context"
+	"gotest.tools/assert"
 	"testing"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/loft-sh/vcluster/pkg/constants"
-	generictesting "github.com/loft-sh/vcluster/pkg/controllers/resources/generic/testing"
-	"github.com/loft-sh/vcluster/pkg/util/locks"
-	"github.com/loft-sh/vcluster/pkg/util/loghelper"
-	testingutil "github.com/loft-sh/vcluster/pkg/util/testing"
-
+	generictesting "github.com/loft-sh/vcluster/pkg/controllers/syncer/testing"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -20,19 +16,15 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 )
 
-func newFakeFakeSyncer(ctx context.Context, lockFactory locks.LockFactory, vClient *testingutil.FakeIndexClient) (*fakeSyncer, error) {
-	err := vClient.IndexField(ctx, &corev1.PersistentVolumeClaim{}, constants.IndexByAssigned, func(rawObj client.Object) []string {
+func newFakeFakeSyncer(t *testing.T, ctx *synccontext.RegisterContext) (*synccontext.SyncContext, *fakePersistentVolumeSyncer) {
+	err := ctx.VirtualManager.GetFieldIndexer().IndexField(ctx.Context, &corev1.PersistentVolumeClaim{}, constants.IndexByAssigned, func(rawObj client.Object) []string {
 		pod := rawObj.(*corev1.PersistentVolumeClaim)
 		return []string{pod.Spec.VolumeName}
 	})
-	if err != nil {
-		return nil, err
-	}
+	assert.NilError(t, err)
 
-	return &fakeSyncer{
-		sharedMutex:   lockFactory.GetLock("persistent-volumes-controller"),
-		virtualClient: vClient,
-	}, nil
+	syncContext, object := generictesting.FakeStartSyncer(t, ctx, NewFakeSyncer)
+	return syncContext, object.(*fakePersistentVolumeSyncer)
 }
 
 func TestFakeSync(t *testing.T) {
@@ -40,7 +32,6 @@ func TestFakeSync(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "testpvc",
 			Namespace:       "testns",
-			ClusterName:     "myvcluster",
 			ResourceVersion: generictesting.FakeClientResourceVersion,
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
@@ -90,7 +81,6 @@ func TestFakeSync(t *testing.T) {
 	}
 	pvWithFinalizers := basePv.DeepCopy()
 	pvWithFinalizers.Finalizers = []string{"myfinalizer"}
-	lockFactory := locks.NewDefaultLockFactory()
 
 	generictesting.RunTests(t, []*generictesting.SyncTest{
 		{
@@ -100,23 +90,10 @@ func TestFakeSync(t *testing.T) {
 				corev1.SchemeGroupVersion.WithKind("PersistentVolume"):      {basePv},
 				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {basePvc},
 			},
-			Sync: func(ctx context.Context, pClient *testingutil.FakeIndexClient, vClient *testingutil.FakeIndexClient, scheme *runtime.Scheme, log loghelper.Logger) {
-				syncer, err := newFakeFakeSyncer(ctx, lockFactory, vClient)
-				if err != nil {
-					t.Fatal(err)
-				}
-
-				needed, err := syncer.CreateNeeded(ctx, basePvName)
-				if err != nil {
-					t.Fatal(err)
-				} else if !needed {
-					t.Fatal("Expected create to be needed")
-				}
-
-				err = syncer.Create(ctx, basePvName, log)
-				if err != nil {
-					t.Fatal(err)
-				}
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncContext, syncer := newFakeFakeSyncer(t, ctx)
+				_, err := syncer.FakeSyncUp(syncContext, basePvName)
+				assert.NilError(t, err)
 			},
 		},
 		{
@@ -126,23 +103,10 @@ func TestFakeSync(t *testing.T) {
 				corev1.SchemeGroupVersion.WithKind("PersistentVolume"):      {},
 				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {},
 			},
-			Sync: func(ctx context.Context, pClient *testingutil.FakeIndexClient, vClient *testingutil.FakeIndexClient, scheme *runtime.Scheme, log loghelper.Logger) {
-				syncer, err := newFakeFakeSyncer(ctx, lockFactory, vClient)
-				if err != nil {
-					t.Fatal(err)
-				}
-
-				needed, err := syncer.CreateNeeded(ctx, basePvName)
-				if err != nil {
-					t.Fatal(err)
-				} else if needed {
-					t.Fatal("Expected create to be not needed")
-				}
-
-				err = syncer.Create(ctx, basePvName, log)
-				if err != nil {
-					t.Fatal(err)
-				}
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncContext, syncer := newFakeFakeSyncer(t, ctx)
+				_, err := syncer.FakeSyncUp(syncContext, basePvName)
+				assert.NilError(t, err)
 			},
 		},
 		{
@@ -152,68 +116,10 @@ func TestFakeSync(t *testing.T) {
 				corev1.SchemeGroupVersion.WithKind("PersistentVolume"):      {},
 				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {},
 			},
-			Sync: func(ctx context.Context, pClient *testingutil.FakeIndexClient, vClient *testingutil.FakeIndexClient, scheme *runtime.Scheme, log loghelper.Logger) {
-				syncer, err := newFakeFakeSyncer(ctx, lockFactory, vClient)
-				if err != nil {
-					t.Fatal(err)
-				}
-
-				needed, err := syncer.DeleteNeeded(ctx, pvWithFinalizers)
-				if err != nil {
-					t.Fatal(err)
-				} else if !needed {
-					t.Fatal("Expected delete to be needed")
-				}
-
-				err = syncer.Delete(ctx, pvWithFinalizers, log)
-				if err != nil {
-					t.Fatal(err)
-				}
-			},
-		},
-		{
-			Name:                "Delete PVC (should fail)",
-			InitialVirtualState: []runtime.Object{basePvc},
-			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
-				corev1.SchemeGroupVersion.WithKind("PersistentVolume"):      {},
-				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {basePvc},
-			},
-			Sync: func(ctx context.Context, pClient *testingutil.FakeIndexClient, vClient *testingutil.FakeIndexClient, scheme *runtime.Scheme, log loghelper.Logger) {
-				syncer, err := newFakeFakeSyncer(ctx, lockFactory, vClient)
-				if err != nil {
-					t.Fatal(err)
-				}
-
-				needed, err := syncer.DeleteNeeded(ctx, basePvc)
-				if err == nil {
-					t.Fatal("Expected error")
-				} else if needed {
-					t.Fatal("Expected delete to be not needed")
-				}
-				if !strings.Contains(err.Error(), "is not a persistent volume") {
-					t.Fatal("Wrong error")
-				}
-			},
-		},
-		{
-			Name:                "Delete pv with pvc (should fail)",
-			InitialVirtualState: []runtime.Object{basePvc, basePv},
-			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
-				corev1.SchemeGroupVersion.WithKind("PersistentVolume"):      {basePv},
-				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {basePvc},
-			},
-			Sync: func(ctx context.Context, pClient *testingutil.FakeIndexClient, vClient *testingutil.FakeIndexClient, scheme *runtime.Scheme, log loghelper.Logger) {
-				syncer, err := newFakeFakeSyncer(ctx, lockFactory, vClient)
-				if err != nil {
-					t.Fatal(err)
-				}
-
-				needed, err := syncer.DeleteNeeded(ctx, basePv)
-				if err != nil {
-					t.Fatal(err)
-				} else if needed {
-					t.Fatal("Expected delete to be not needed")
-				}
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncContext, syncer := newFakeFakeSyncer(t, ctx)
+				_, err := syncer.FakeSync(syncContext, pvWithFinalizers)
+				assert.NilError(t, err)
 			},
 		},
 		{
@@ -223,23 +129,10 @@ func TestFakeSync(t *testing.T) {
 				corev1.SchemeGroupVersion.WithKind("PersistentVolume"):      {},
 				corev1.SchemeGroupVersion.WithKind("PersistentVolumeClaim"): {},
 			},
-			Sync: func(ctx context.Context, pClient *testingutil.FakeIndexClient, vClient *testingutil.FakeIndexClient, scheme *runtime.Scheme, log loghelper.Logger) {
-				syncer, err := newFakeFakeSyncer(ctx, lockFactory, vClient)
-				if err != nil {
-					t.Fatal(err)
-				}
-
-				needed, err := syncer.DeleteNeeded(ctx, basePv)
-				if err != nil {
-					t.Fatal(err)
-				} else if !needed {
-					t.Fatal("Expected delete to be needed")
-				}
-
-				err = syncer.Delete(ctx, basePv, log)
-				if err != nil {
-					t.Fatal(err)
-				}
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncContext, syncer := newFakeFakeSyncer(t, ctx)
+				_, err := syncer.FakeSync(syncContext, basePv)
+				assert.NilError(t, err)
 			},
 		},
 	})

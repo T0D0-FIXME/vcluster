@@ -1,10 +1,11 @@
 package constants
 
 const (
-	IndexByVName         = "IndexByVName"
+	IndexByPhysicalName  = "IndexByPhysicalName"
 	IndexByAssigned      = "IndexByAssigned"
 	IndexByStorageClass  = "IndexByStorageClass"
 	IndexByIngressSecret = "IndexByIngressSecret"
+	IndexByPodSecret     = "IndexByPodSecret"
 	IndexByConfigMap     = "IndexByConfigMap"
 	IndexByClusterIP     = "IndexByClusterIP"
 )

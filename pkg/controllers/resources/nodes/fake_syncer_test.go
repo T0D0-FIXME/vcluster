@@ -2,18 +2,17 @@ package nodes
 
 import (
 	"context"
-	"github.com/loft-sh/vcluster/pkg/controllers/resources/nodes/nodeservice"
-	"strings"
+	"github.com/loft-sh/vcluster/pkg/controllers/syncer"
+	synccontext "github.com/loft-sh/vcluster/pkg/controllers/syncer/context"
+	"gotest.tools/assert"
 	"testing"
+
+	"github.com/loft-sh/vcluster/pkg/controllers/resources/nodes/nodeservice"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/loft-sh/vcluster/pkg/constants"
-	generictesting "github.com/loft-sh/vcluster/pkg/controllers/resources/generic/testing"
-	"github.com/loft-sh/vcluster/pkg/util/locks"
-	"github.com/loft-sh/vcluster/pkg/util/loghelper"
-	testingutil "github.com/loft-sh/vcluster/pkg/util/testing"
-
+	generictesting "github.com/loft-sh/vcluster/pkg/controllers/syncer/testing"
 	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -22,6 +21,20 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 )
+
+func newFakeFakeSyncer(t *testing.T, ctx *synccontext.RegisterContext) (*synccontext.SyncContext, *fakeNodeSyncer) {
+	// we need that index here as well otherwise we wouldn't find the related pod
+	err := ctx.VirtualManager.GetFieldIndexer().IndexField(ctx.Context, &corev1.Pod{}, constants.IndexByAssigned, func(rawObj client.Object) []string {
+		pod := rawObj.(*corev1.Pod)
+		return []string{pod.Spec.NodeName}
+	})
+	assert.NilError(t, err)
+
+	syncContext, object := generictesting.FakeStartSyncer(t, ctx, func(ctx *synccontext.RegisterContext) (syncer.Object, error) {
+		return NewFakeSyncer(ctx, &fakeNodeServiceProvider{})
+	})
+	return syncContext, object.(*fakeNodeSyncer)
+}
 
 type fakeNodeServiceProvider struct{}
 
@@ -32,24 +45,8 @@ func (f *fakeNodeServiceProvider) GetNodeIP(ctx context.Context, name types.Name
 	return "127.0.0.1", nil
 }
 
-func newFakeFakeSyncer(ctx context.Context, lockFactory locks.LockFactory, vClient *testingutil.FakeIndexClient) (*fakeSyncer, error) {
-	err := vClient.IndexField(ctx, &corev1.Pod{}, constants.IndexByAssigned, func(rawObj client.Object) []string {
-		pod := rawObj.(*corev1.Pod)
-		return []string{pod.Spec.NodeName}
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	return &fakeSyncer{
-		sharedNodesMutex:    lockFactory.GetLock("nodes-controller"),
-		nodeServiceProvider: &fakeNodeServiceProvider{},
-		virtualClient:       vClient,
-	}, nil
-}
-
 func TestFakeSync(t *testing.T) {
-	fakeGUID := newGuid()
+	fakeGUID := newGUID()
 	now := metav1.Now()
 	baseName := types.NamespacedName{
 		Name: "mynode",
@@ -144,7 +141,6 @@ func TestFakeSync(t *testing.T) {
 			Images: []corev1.ContainerImage{},
 		},
 	}
-	lockFactory := locks.NewDefaultLockFactory()
 
 	generictesting.RunTests(t, []*generictesting.SyncTest{
 		{
@@ -154,23 +150,10 @@ func TestFakeSync(t *testing.T) {
 				corev1.SchemeGroupVersion.WithKind("Node"): {baseNode},
 				corev1.SchemeGroupVersion.WithKind("Pod"):  {basePod},
 			},
-			Sync: func(ctx context.Context, pClient *testingutil.FakeIndexClient, vClient *testingutil.FakeIndexClient, scheme *runtime.Scheme, log loghelper.Logger) {
-				syncer, err := newFakeFakeSyncer(ctx, lockFactory, vClient)
-				if err != nil {
-					t.Fatal(err)
-				}
-
-				needed, err := syncer.CreateNeeded(ctx, baseName)
-				if err != nil {
-					t.Fatal(err)
-				} else if !needed {
-					t.Fatal("Expected create to be needed")
-				}
-
-				err = syncer.Create(ctx, baseName, log)
-				if err != nil {
-					t.Fatal(err)
-				}
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncContext, syncer := newFakeFakeSyncer(t, ctx)
+				_, err := syncer.FakeSyncUp(syncContext, baseName)
+				assert.NilError(t, err)
 			},
 			Compare: func(obj1 runtime.Object, obj2 runtime.Object) bool {
 				node1, ok1 := obj1.(*corev1.Node)
@@ -197,95 +180,17 @@ func TestFakeSync(t *testing.T) {
 			},
 		},
 		{
-			Name:                "Create node without pod",
-			InitialVirtualState: []runtime.Object{},
-			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
-				corev1.SchemeGroupVersion.WithKind("Node"): {},
-				corev1.SchemeGroupVersion.WithKind("Pod"):  {},
-			},
-			Sync: func(ctx context.Context, pClient *testingutil.FakeIndexClient, vClient *testingutil.FakeIndexClient, scheme *runtime.Scheme, log loghelper.Logger) {
-				syncer, err := newFakeFakeSyncer(ctx, lockFactory, vClient)
-				if err != nil {
-					t.Fatal(err)
-				}
-
-				needed, err := syncer.CreateNeeded(ctx, baseName)
-				if err != nil {
-					t.Fatal(err)
-				} else if needed {
-					t.Fatal("Expected create to be not needed")
-				}
-			},
-		},
-		{
 			Name:                "Delete",
 			InitialVirtualState: []runtime.Object{baseNode},
 			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
 				corev1.SchemeGroupVersion.WithKind("Node"): {},
 				corev1.SchemeGroupVersion.WithKind("Pod"):  {},
 			},
-			Sync: func(ctx context.Context, pClient *testingutil.FakeIndexClient, vClient *testingutil.FakeIndexClient, scheme *runtime.Scheme, log loghelper.Logger) {
-				syncer, err := newFakeFakeSyncer(ctx, lockFactory, vClient)
-				if err != nil {
-					t.Fatal(err)
-				}
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncContext, syncer := newFakeFakeSyncer(t, ctx)
 
-				needed, err := syncer.DeleteNeeded(ctx, baseNode)
-				if err != nil {
-					t.Fatal(err)
-				} else if !needed {
-					t.Fatal("Expected create to be needed")
-				}
-
-				err = syncer.Delete(ctx, baseNode, log)
-				if err != nil {
-					t.Fatal(err)
-				}
-			},
-		},
-		{
-			Name:                "Delete node with pod (should fail)",
-			InitialVirtualState: []runtime.Object{basePod, baseNode},
-			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
-				corev1.SchemeGroupVersion.WithKind("Node"): {baseNode},
-				corev1.SchemeGroupVersion.WithKind("Pod"):  {basePod},
-			},
-			Sync: func(ctx context.Context, pClient *testingutil.FakeIndexClient, vClient *testingutil.FakeIndexClient, scheme *runtime.Scheme, log loghelper.Logger) {
-				syncer, err := newFakeFakeSyncer(ctx, lockFactory, vClient)
-				if err != nil {
-					t.Fatal(err)
-				}
-
-				needed, err := syncer.DeleteNeeded(ctx, baseNode)
-				if err != nil {
-					t.Fatal(err)
-				} else if needed {
-					t.Fatal("Expected create to be not needed")
-				}
-			},
-		},
-		{
-			Name:                "Delete pod (should fail)",
-			InitialVirtualState: []runtime.Object{basePod},
-			ExpectedVirtualState: map[schema.GroupVersionKind][]runtime.Object{
-				corev1.SchemeGroupVersion.WithKind("Node"): {},
-				corev1.SchemeGroupVersion.WithKind("Pod"):  {basePod},
-			},
-			Sync: func(ctx context.Context, pClient *testingutil.FakeIndexClient, vClient *testingutil.FakeIndexClient, scheme *runtime.Scheme, log loghelper.Logger) {
-				syncer, err := newFakeFakeSyncer(ctx, lockFactory, vClient)
-				if err != nil {
-					t.Fatal(err)
-				}
-
-				needed, err := syncer.DeleteNeeded(ctx, basePod)
-				if err == nil {
-					t.Fatal("Expected error")
-				} else if needed {
-					t.Fatal("Expected delete to be not needed")
-				}
-				if !strings.Contains(err.Error(), "is not a node") {
-					t.Fatal("Wrong error")
-				}
+				_, err := syncer.FakeSync(syncContext, baseNode)
+				assert.NilError(t, err)
 			},
 		},
 	})

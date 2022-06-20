@@ -5,13 +5,19 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
+
 	"github.com/loft-sh/vcluster/pkg/constants"
 	"github.com/loft-sh/vcluster/pkg/controllers/resources/nodes/nodeservice"
 	"github.com/loft-sh/vcluster/pkg/metrics"
 	"github.com/loft-sh/vcluster/pkg/server/handler"
+	"github.com/loft-sh/vcluster/pkg/util/clienthelper"
 	requestpkg "github.com/loft-sh/vcluster/pkg/util/request"
 	"github.com/prometheus/common/expfmt"
-	"io/ioutil"
 	corev1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
@@ -19,16 +25,11 @@ import (
 	"k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/client-go/rest"
 	statsv1alpha1 "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
-	"net/http"
-	"net/http/httptest"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"strconv"
-	"strings"
 )
 
-func WithMetricsProxy(h http.Handler, localManager ctrl.Manager, virtualManager ctrl.Manager, targetNamespace string) http.Handler {
-	s := serializer.NewCodecFactory(virtualManager.GetScheme())
+func WithMetricsProxy(h http.Handler, localConfig *rest.Config, cachedVirtualClient client.Client, targetNamespace string) http.Handler {
+	s := serializer.NewCodecFactory(cachedVirtualClient.Scheme())
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		info, ok := request.RequestInfoFrom(req.Context())
 		if !ok {
@@ -68,7 +69,7 @@ func WithMetricsProxy(h http.Handler, localManager ctrl.Manager, virtualManager 
 			req.URL.Path = strings.Join(splitted, "/")
 
 			// execute the request
-			_, err := handleNodeRequest(localManager.GetConfig(), virtualManager.GetClient(), targetNamespace, w, req)
+			_, err := handleNodeRequest(localConfig, cachedVirtualClient, targetNamespace, w, req)
 			if err != nil {
 				responsewriters.ErrorNegotiated(err, s, corev1.SchemeGroupVersion, w, req)
 				return
@@ -92,7 +93,7 @@ func writeWithHeader(w http.ResponseWriter, code int, header http.Header, body [
 	}
 
 	w.WriteHeader(code)
-	w.Write(body)
+	_, _ = w.Write(body)
 }
 
 func rewritePrometheusMetrics(req *http.Request, data []byte, targetNamespace string, vClient client.Client) ([]byte, error) {
@@ -141,7 +142,7 @@ func handleNodeRequest(localConfig *rest.Config, vClient client.Client, targetNa
 
 	w.Header().Set("Content-Type", string(expfmt.Negotiate(req.Header)))
 	w.WriteHeader(code)
-	w.Write(newData)
+	_, _ = w.Write(newData)
 	return true, nil
 }
 
@@ -161,7 +162,7 @@ func rewriteStats(ctx context.Context, data []byte, targetNamespace string, vCli
 
 		// search if we can find the pod by name in the virtual cluster
 		podList := &corev1.PodList{}
-		err := vClient.List(ctx, podList, client.MatchingFields{constants.IndexByVName: pod.PodRef.Name})
+		err := vClient.List(ctx, podList, client.MatchingFields{constants.IndexByPhysicalName: pod.PodRef.Name})
 		if err != nil {
 			return nil, err
 		}
@@ -175,6 +176,26 @@ func rewriteStats(ctx context.Context, data []byte, targetNamespace string, vCli
 		pod.PodRef.Name = vPod.Name
 		pod.PodRef.Namespace = vPod.Namespace
 		pod.PodRef.UID = string(vPod.UID)
+
+		newVolumes := []statsv1alpha1.VolumeStats{}
+		for _, volume := range pod.VolumeStats {
+			if volume.PVCRef != nil {
+				vPVC := &corev1.PersistentVolumeClaim{}
+				err = clienthelper.GetByIndex(ctx, vClient, vPVC, constants.IndexByPhysicalName, volume.PVCRef.Name)
+				if err != nil {
+					return nil, err
+				}
+				if vPVC == nil {
+					continue
+				}
+				volume.PVCRef.Name = vPVC.Name
+				volume.PVCRef.Namespace = vPVC.Namespace
+			}
+
+			newVolumes = append(newVolumes, volume)
+		}
+		pod.VolumeStats = newVolumes
+
 		newPods = append(newPods, pod)
 	}
 	stats.Pods = newPods
@@ -215,7 +236,7 @@ func executeRequest(req *http.Request, h http.Handler) (int, http.Header, []byte
 }
 
 func isNodesProxy(r *request.RequestInfo) bool {
-	if r.IsResourceRequest == false {
+	if !r.IsResourceRequest {
 		return false
 	}
 

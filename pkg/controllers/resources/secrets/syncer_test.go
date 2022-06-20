@@ -1,10 +1,11 @@
 package secrets
 
 import (
-	"context"
-	"github.com/loft-sh/vcluster/pkg/util/loghelper"
-	testingutil "github.com/loft-sh/vcluster/pkg/util/testing"
+	"github.com/loft-sh/vcluster/pkg/controllers/syncer"
+	synccontext "github.com/loft-sh/vcluster/pkg/controllers/syncer/context"
+	"github.com/loft-sh/vcluster/pkg/controllers/syncer/translator"
 	"github.com/loft-sh/vcluster/pkg/util/translate"
+	"gotest.tools/assert"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -12,24 +13,25 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"testing"
 
-	generictesting "github.com/loft-sh/vcluster/pkg/controllers/resources/generic/testing"
+	generictesting "github.com/loft-sh/vcluster/pkg/controllers/syncer/testing"
 )
 
-func newFakeSyncer(ctx context.Context, pClient *testingutil.FakeIndexClient, vClient *testingutil.FakeIndexClient) *syncer {
-	return &syncer{
-		eventRecoder:     &testingutil.FakeEventRecorder{},
-		targetNamespace:  "test",
-		virtualClient:    vClient,
-		localClient:      pClient,
-		includeIngresses: true,
-	}
+func newFakeSyncer(t *testing.T, ctx *synccontext.RegisterContext) (*synccontext.SyncContext, syncer.Object) {
+	return generictesting.FakeStartSyncer(t, ctx, func(ctx *synccontext.RegisterContext) (syncer.Object, error) {
+		return NewSyncer(ctx, false)
+	})
 }
 
 func TestSync(t *testing.T) {
+	testLabel := "test-label"
+	testLabelValue := "label-value"
 	baseSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-secret",
 			Namespace: "test",
+			Labels: map[string]string{
+				testLabel: testLabelValue,
+			},
 		},
 	}
 	updatedSecret := &corev1.Secret{
@@ -42,8 +44,14 @@ func TestSync(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      translate.PhysicalName(baseSecret.Name, baseSecret.Namespace),
 			Namespace: "test",
+			Annotations: map[string]string{
+				translator.NameAnnotation:      baseSecret.Name,
+				translator.NamespaceAnnotation: baseSecret.Namespace,
+			},
 			Labels: map[string]string{
-				translate.NamespaceLabel: translate.NamespaceLabelValue(baseSecret.Namespace),
+				translate.NamespaceLabel:              baseSecret.Namespace,
+				testLabel:                             testLabelValue,
+				translator.ConvertLabelKey(testLabel): testLabelValue,
 			},
 		},
 	}
@@ -79,19 +87,10 @@ func TestSync(t *testing.T) {
 			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
 				corev1.SchemeGroupVersion.WithKind("Secret"): {},
 			},
-			Sync: func(ctx context.Context, pClient *testingutil.FakeIndexClient, vClient *testingutil.FakeIndexClient, scheme *runtime.Scheme, log loghelper.Logger) {
-				syncer := newFakeSyncer(ctx, pClient, vClient)
-				needed, err := syncer.ForwardCreateNeeded(baseSecret)
-				if err != nil {
-					t.Fatal(err)
-				} else if needed {
-					t.Fatal("Expected forward create to be not needed")
-				}
-
-				_, err = syncer.ForwardCreate(ctx, baseSecret, log)
-				if err != nil {
-					t.Fatal(err)
-				}
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncContext, syncer := newFakeSyncer(t, ctx)
+				_, err := syncer.(*secretSyncer).SyncDown(syncContext, baseSecret)
+				assert.NilError(t, err)
 			},
 		},
 		{
@@ -105,19 +104,11 @@ func TestSync(t *testing.T) {
 					syncedSecret,
 				},
 			},
-			Sync: func(ctx context.Context, pClient *testingutil.FakeIndexClient, vClient *testingutil.FakeIndexClient, scheme *runtime.Scheme, log loghelper.Logger) {
-				syncer := newFakeSyncer(ctx, pClient, vClient)
-				needed, err := syncer.ForwardCreateNeeded(baseSecret)
-				if err != nil {
-					t.Fatal(err)
-				} else if !needed {
-					t.Fatal("Expected forward create to be needed")
-				}
-
-				_, err = syncer.ForwardCreate(ctx, baseSecret, log)
-				if err != nil {
-					t.Fatal(err)
-				}
+			Sync: func(ctx *synccontext.RegisterContext) {
+				ctx.Options.SyncLabels = []string{testLabel}
+				syncContext, syncer := newFakeSyncer(t, ctx)
+				_, err := syncer.(*secretSyncer).SyncDown(syncContext, baseSecret)
+				assert.NilError(t, err)
 			},
 		},
 		{
@@ -134,19 +125,11 @@ func TestSync(t *testing.T) {
 					updatedSyncedSecret,
 				},
 			},
-			Sync: func(ctx context.Context, pClient *testingutil.FakeIndexClient, vClient *testingutil.FakeIndexClient, scheme *runtime.Scheme, log loghelper.Logger) {
-				syncer := newFakeSyncer(ctx, pClient, vClient)
-				needed, err := syncer.ForwardUpdateNeeded(syncedSecret, updatedSecret)
-				if err != nil {
-					t.Fatal(err)
-				} else if !needed {
-					t.Fatal("Expected forward update to be needed")
-				}
-
-				_, err = syncer.ForwardUpdate(ctx, syncedSecret, updatedSecret, log)
-				if err != nil {
-					t.Fatal(err)
-				}
+			Sync: func(ctx *synccontext.RegisterContext) {
+				ctx.Options.SyncLabels = []string{testLabel}
+				syncContext, syncer := newFakeSyncer(t, ctx)
+				_, err := syncer.(*secretSyncer).Sync(syncContext, syncedSecret, updatedSecret)
+				assert.NilError(t, err)
 			},
 		},
 		{
@@ -160,19 +143,10 @@ func TestSync(t *testing.T) {
 			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
 				corev1.SchemeGroupVersion.WithKind("Secret"): {},
 			},
-			Sync: func(ctx context.Context, pClient *testingutil.FakeIndexClient, vClient *testingutil.FakeIndexClient, scheme *runtime.Scheme, log loghelper.Logger) {
-				syncer := newFakeSyncer(ctx, pClient, vClient)
-				needed, err := syncer.ForwardUpdateNeeded(syncedSecret, updatedSecret)
-				if err != nil {
-					t.Fatal(err)
-				} else if !needed {
-					t.Fatal("Expected forward update to be needed")
-				}
-
-				_, err = syncer.ForwardUpdate(ctx, syncedSecret, updatedSecret, log)
-				if err != nil {
-					t.Fatal(err)
-				}
+			Sync: func(ctx *synccontext.RegisterContext) {
+				syncContext, syncer := newFakeSyncer(t, ctx)
+				_, err := syncer.(*secretSyncer).Sync(syncContext, syncedSecret, updatedSecret)
+				assert.NilError(t, err)
 			},
 		},
 	})

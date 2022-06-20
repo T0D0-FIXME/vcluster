@@ -1,22 +1,34 @@
 package cmd
 
 import (
-	"context"
+	"encoding/json"
+	"github.com/loft-sh/vcluster/cmd/vclusterctl/cmd/find"
+	"k8s.io/client-go/tools/clientcmd"
+	"strings"
+	"time"
+
 	"github.com/loft-sh/vcluster/cmd/vclusterctl/flags"
 	"github.com/loft-sh/vcluster/cmd/vclusterctl/log"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
-	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/clientcmd"
 )
+
+// VCluster holds information about a cluster
+type VCluster struct {
+	Name       string
+	Namespace  string
+	Created    time.Time
+	AgeSeconds int
+	Status     string
+}
 
 // ListCmd holds the login cmd flags
 type ListCmd struct {
 	*flags.GlobalFlags
 
-	log log.Logger
+	log    log.Logger
+	output string
 }
 
 // NewListCmd creates a new command
@@ -37,6 +49,7 @@ Lists all virtual clusters
 
 Example:
 vcluster list
+vcluster list --output json
 vcluster list --namespace test
 #######################################################
 	`,
@@ -46,60 +59,62 @@ vcluster list --namespace test
 		},
 	}
 
+	cobraCmd.Flags().StringVar(&cmd.output, "output", "table", "Choose the format of the output. [table|json]")
+
 	return cobraCmd
 }
 
 // Run executes the functionality
 func (cmd *ListCmd) Run(cobraCmd *cobra.Command, args []string) error {
-	// first load the kube config
-	kubeClientConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(clientcmd.NewDefaultClientConfigLoadingRules(), &clientcmd.ConfigOverrides{
-		CurrentContext: cmd.Context,
-	})
+	if cmd.Context == "" {
+		rawConfig, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(clientcmd.NewDefaultClientConfigLoadingRules(), &clientcmd.ConfigOverrides{}).RawConfig()
+		if err != nil {
+			return err
+		}
+
+		cmd.Context = rawConfig.CurrentContext
+	}
+
 	namespace := metav1.NamespaceAll
 	if cmd.Namespace != "" {
 		namespace = cmd.Namespace
 	}
 
-	// get all statefulsets with the label app=vcluster
-	restConfig, err := kubeClientConfig.ClientConfig()
-	if err != nil {
-		return err
-	}
-	client, err := kubernetes.NewForConfig(restConfig)
+	vClusters, err := find.ListVClusters(cmd.Context, "", namespace)
 	if err != nil {
 		return err
 	}
 
-	statefulSets, err := client.AppsV1().StatefulSets(namespace).List(context.Background(), metav1.ListOptions{LabelSelector: "app=vcluster"})
-	if err != nil {
-		if kerrors.IsForbidden(err) {
-			// try the current namespace instead
-			namespace, _, err = kubeClientConfig.Namespace()
-			if err != nil {
-				return err
-			} else if namespace == "" {
-				namespace = "default"
+	if cmd.output == "json" {
+		bytes, err := json.MarshalIndent(&vClusters, "", "    ")
+		if err != nil {
+			return errors.Wrap(err, "json marshal vclusters")
+		}
+		cmd.log.WriteString(string(bytes) + "\n")
+	} else {
+		header := []string{"NAME", "NAMESPACE", "STATUS", "CONNECTED", "CREATED", "AGE"}
+		values := [][]string{}
+		for _, vcluster := range vClusters {
+			connected := ""
+			if cmd.Context == find.VClusterContextName(vcluster.Name, vcluster.Namespace, vcluster.Context) {
+				connected = "True"
 			}
 
-			statefulSets, err = client.AppsV1().StatefulSets(namespace).List(context.Background(), metav1.ListOptions{LabelSelector: "app=vcluster"})
-			if err != nil {
-				return err
-			}
-		} else {
-			return errors.Wrap(err, "list stateful sets")
+			values = append(values, []string{
+				vcluster.Name,
+				vcluster.Namespace,
+				string(vcluster.Status),
+				connected,
+				vcluster.Created.String(),
+				time.Since(vcluster.Created).Round(1 * time.Second).String(),
+			})
+		}
+
+		log.PrintTable(cmd.log, header, values)
+		if strings.HasPrefix(cmd.Context, "vcluster_") {
+			cmd.log.Infof("Run `vcluster disconnect` to switch back to the parent context")
 		}
 	}
 
-	header := []string{"NAME", "NAMESPACE", "CREATED"}
-	values := [][]string{}
-	for _, s := range statefulSets.Items {
-		values = append(values, []string{
-			s.Name,
-			s.Namespace,
-			s.CreationTimestamp.String(),
-		})
-	}
-
-	log.PrintTable(cmd.log, header, values)
 	return nil
 }

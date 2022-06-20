@@ -5,3 +5,6 @@
 .devspace/
 /test
 .DS_Store
+profile.out
+*.swp
+/vcluster

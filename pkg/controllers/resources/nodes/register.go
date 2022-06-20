@@ -1,28 +1,25 @@
 package nodes
 
 import (
-	context2 "github.com/loft-sh/vcluster/cmd/vcluster/context"
-	"github.com/loft-sh/vcluster/pkg/constants"
-	corev1 "k8s.io/api/core/v1"
+	"github.com/loft-sh/vcluster/pkg/controllers/resources/nodes/nodeservice"
+	"github.com/loft-sh/vcluster/pkg/controllers/syncer"
+	synccontext "github.com/loft-sh/vcluster/pkg/controllers/syncer/context"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-func RegisterIndices(ctx *context2.ControllerContext) error {
-	// index pods by their assigned node
-	err := ctx.VirtualManager.GetFieldIndexer().IndexField(ctx.Context, &corev1.Pod{}, constants.IndexByAssigned, func(rawObj client.Object) []string {
-		pod := rawObj.(*corev1.Pod)
-		return []string{pod.Spec.NodeName}
+func New(ctx *synccontext.RegisterContext) (syncer.Object, error) {
+	uncachedVirtualClient, err := client.New(ctx.VirtualManager.GetConfig(), client.Options{
+		Scheme: ctx.VirtualManager.GetScheme(),
+		Mapper: ctx.VirtualManager.GetRESTMapper(),
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	return nil
-}
-
-func Register(ctx *context2.ControllerContext) error {
-	if ctx.Options.UseFakeNodes && ctx.Options.NodeSelector == "" {
-		return RegisterFakeSyncer(ctx)
+	nodeService := nodeservice.NewNodeServiceProvider(ctx.Options.ServiceName, ctx.CurrentNamespace, ctx.CurrentNamespaceClient, ctx.VirtualManager.GetClient(), uncachedVirtualClient)
+	if !ctx.Controllers["nodes"] {
+		return NewFakeSyncer(ctx, nodeService)
 	}
-	return RegisterSyncer(ctx)
+
+	return NewSyncer(ctx, nodeService)
 }

@@ -23,11 +23,11 @@ var k8sNativeSchemeOnce sync.Once
 func kubernetesNativeScheme() *runtime.Scheme {
 	k8sNativeSchemeOnce.Do(func() {
 		k8sNativeScheme = runtime.NewScheme()
-		scheme.AddToScheme(k8sNativeScheme)
+		_ = scheme.AddToScheme(k8sNativeScheme)
 		// API extensions are not in the above scheme set,
 		// and must thus be added separately.
-		apiextensionsv1beta1.AddToScheme(k8sNativeScheme)
-		apiextensionsv1.AddToScheme(k8sNativeScheme)
+		_ = apiextensionsv1beta1.AddToScheme(k8sNativeScheme)
+		_ = apiextensionsv1.AddToScheme(k8sNativeScheme)
 	})
 	return k8sNativeScheme
 }
@@ -45,7 +45,7 @@ spec:
 	scheme := kubernetesNativeScheme()
 	decoder := NewDecoder(scheme, false)
 
-	pod, err := decoder.Decode([]byte(examplePod))
+	pod, err := decoder.Decode([]byte(examplePod), nil)
 	if err != nil {
 		t.Fatal(err)
 	} else if _, ok := pod.(*corev1.Pod); !ok {
@@ -66,7 +66,7 @@ spec:
 	scheme := kubernetesNativeScheme()
 	decoder := NewDecoder(scheme, false)
 
-	obj, err := decoder.Decode([]byte(examplePod))
+	obj, err := decoder.Decode([]byte(examplePod), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
